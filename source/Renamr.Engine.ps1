@@ -1,4 +1,9 @@
-﻿# Renamr engine - faithful port of plan.py + apply/undo logic. Windows PowerShell 5.1 and PowerShell 7 compatible.
+﻿# Copyright (C) 2026 JeepNWilly
+# Renamr is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3
+# of the License, or (at your option) any later version. It comes with no warranty.
+# See the LICENSE file in the repository root or <https://www.gnu.org/licenses/>.
+# Renamr engine - faithful port of plan.py + apply/undo logic. Windows PowerShell 5.1 and PowerShell 7 compatible.
 # No UI code here. The GUI (Renamr.ps1) loads this into a background runspace.
 # Paths are always Windows-style (backslash) strings; path helpers below do not depend on the host OS.
 

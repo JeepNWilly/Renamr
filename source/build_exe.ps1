@@ -1,3 +1,8 @@
+# Copyright (C) 2026 JeepNWilly
+# Renamr is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3
+# of the License, or (at your option) any later version. It comes with no warranty.
+# See the LICENSE file in the repository root or <https://www.gnu.org/licenses/>.
 <#
 .SYNOPSIS  Builds the single-file app from source:
            1) ..\Renamr.ps1  = Renamr.Gui.ps1 with Renamr.Engine.ps1 embedded (Base64)

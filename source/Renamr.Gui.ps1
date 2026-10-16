@@ -1,4 +1,9 @@
-﻿# Renamr GUI (WinForms). Windows PowerShell 5.1. The engine runs in a background runspace so the UI stays responsive.
+﻿# Copyright (C) 2026 JeepNWilly
+# Renamr is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3
+# of the License, or (at your option) any later version. It comes with no warranty.
+# See the LICENSE file in the repository root or <https://www.gnu.org/licenses/>.
+# Renamr GUI (WinForms). Windows PowerShell 5.1. The engine runs in a background runspace so the UI stays responsive.
 # In a built Renamr.ps1 / .exe, build_exe.ps1 inserts the engine source into $PR_EMBEDDED_ENGINE below.
 $PR_EMBEDDED_ENGINE = $null  #@@ENGINE@@
 $AppVersion = 'dev'  #@@VERSION@@
