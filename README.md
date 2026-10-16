@@ -40,4 +40,4 @@ Renamr uses data from TMDB and TheTVDB and subtitles from The Subtitle Database,
 - [Changelog](source/CHANGELOG.md)
 
 ## Status
-Private project, version in [`source/VERSION`](source/VERSION) (the build number is added at compile time). Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-or-later). You may use, study, change and share Renamr, and any version you share must also be open source under the same license.
+Version in [`source/VERSION`](source/VERSION) (the build number is added at compile time). Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-or-later). You may use, study, change and share Renamr, and any version you share must also be open source under the same license.

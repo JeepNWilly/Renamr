@@ -1,6 +1,6 @@
 # Releases and uploading to GitHub
 
-The repository is **private** for now and will be made public later.
+The repository is public. The exe is published as a release asset.
 
 ## What goes in the repo
 Source, tests, docs, `Renamr.cmd` and `Renamr.ico`. The built `Renamr.exe`/`Renamr.ps1`, settings, caches and logs are git-ignored. Publish the exe as a **GitHub Release asset**, not in the repo.
