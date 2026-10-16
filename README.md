@@ -18,7 +18,7 @@ Episodes: <Series>\Show (Year)\Season 01\Show (Year) - S01E01 - Episode Title.ex
 - Light, dark or system theme. Stop button halts any run cleanly.
 
 ## Quick start
-1. Get the app: build it from source (below) or download `Renamr.exe` from a release.
+1. Get the app: download `Renamr.exe` from the [latest release](../../releases/latest) (nothing to install), or build it from source (below). Windows may show a SmartScreen warning because the exe is not code-signed: choose More info, then Run anyway.
 2. Open it, pick your Movies and/or Series folder, and open **Setup** to paste your free [TMDB API key](https://www.themoviedb.org/settings/api) (and, for TV, a TVDB key).
 3. **Scan**, review, then **Full Run**. Use **Undo...** with the log in the `Logs` folder to reverse a run.
 
