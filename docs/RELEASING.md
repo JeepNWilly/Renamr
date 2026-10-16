@@ -16,7 +16,7 @@ Decided later: either manually after a change you are happy with, or automatical
 2. Create a release from the tag and attach `Renamr.exe` (and a zip with `Renamr.cmd`, `Renamr.ico` and the exe if you like). Paste the matching CHANGELOG section as the notes.
 
 ## Before making the repo public
-- Pick and add a `LICENSE` file (for example MIT, or keep all rights reserved) and update the Status line in the README.
+- License: GPL v3 is chosen and in `LICENSE`. If you ever change it, update `LICENSE` and the README License section; copies already shared stay under the old terms.
 - Confirm no keys, personal paths or logs are in the history: `git log -p | grep -i -E "api|key|token"` and review `git ls-files`.
 - Decide how the app should credit TMDB, TheTVDB and The Subtitle Database (their terms ask for attribution when used publicly).
 - Remove or keep `source/reference/` (the original Python/PowerShell tools).

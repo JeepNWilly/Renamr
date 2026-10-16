@@ -27,6 +27,11 @@ More detail: [User guide](docs/USER_GUIDE.md).
 ## Build from source
 Requires Windows 10/11 with the built-in Windows PowerShell 5.1. From the `source` folder run `BUILD.cmd`. It writes `Renamr.ps1` and `Renamr.exe` one folder up (the exe is compiled with the [ps2exe](https://github.com/MScholtes/PS2EXE) module, which the script installs for the current user if needed). See [Development](docs/DEVELOPMENT.md).
 
+## License
+Copyright (C) 2026 JeepNWilly. Renamr is free software under the GNU General Public License, version 3 or (at your option) any later version. It comes with no warranty. See [LICENSE](LICENSE).
+
+Renamr uses data from TMDB and TheTVDB and subtitles from The Subtitle Database, which have their own terms. This product uses the TMDB API but is not endorsed or certified by TMDB.
+
 ## Documentation
 - [User guide](docs/USER_GUIDE.md)
 - [Development guide](docs/DEVELOPMENT.md) and [source layout](source/README.md)
@@ -35,4 +40,4 @@ Requires Windows 10/11 with the built-in Windows PowerShell 5.1. From the `sourc
 - [Changelog](source/CHANGELOG.md)
 
 ## Status
-Private project, version in [`source/VERSION`](source/VERSION) (the build number is added at compile time). No license has been chosen yet; until one is added, all rights are reserved.
+Private project, version in [`source/VERSION`](source/VERSION) (the build number is added at compile time). Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-or-later). You may use, study, change and share Renamr, and any version you share must also be open source under the same license.
