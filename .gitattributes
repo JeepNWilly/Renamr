@@ -1,0 +1,2 @@
+# keep files byte-for-byte as written (PowerShell 5.1 is picky about encodings and BOMs)
+* -text
