@@ -465,11 +465,12 @@ function PR-Season($db, $seasons, $tid, [int]$s, [string]$provider = 'tmdb') {
 function PR-EpGet($eps, $n) { if ($null -ne $n -and $eps.Map.ContainsKey([int]$n)) { return $eps.Map[[int]$n] }; return $null }
 
 function PR-Left8([string]$x) { if ($x.Length -gt 8) { return $x.Substring(0, 8) }; return $x }
-function PR-NewRow($p) { return [pscustomobject][ordered]@{ old_path = $p; new_path = ''; media_type = ''; tmdb_id = ''; confidence = ''; note = '' } }
+function PR-NewRow($p) { return [pscustomobject][ordered]@{ old_path = $p; new_path = ''; media_type = ''; tmdb_id = ''; confidence = ''; note = ''; fold_path = ''; accepted = ''; group_key = ''; query = ''; case_rep = '' } }
 
 # ---------- planner: port of plan.py main() ----------
 function New-PRPlan {
-    param([string[]]$Paths, [string]$MoviesRoot, [string]$SeriesRoot, $Db, [bool]$ProbeReal = $true, [bool]$FolderLoose = $true)
+    param([string[]]$Paths, [string]$MoviesRoot, [string]$SeriesRoot, $Db, [bool]$ProbeReal = $true, [bool]$FolderLoose = $true, $Force = @{}, [string[]]$OtherPaths = @())
+    if ($null -eq $Force) { $Force = @{} }   # Force: group_key -> match the user chose (Choose match...); OtherPaths: other library files, for clash checks
     $mroot = ''; if ($MoviesRoot) { $mroot = $MoviesRoot.TrimEnd('\') }
     $sroot = ''; if ($SeriesRoot) { $sroot = $SeriesRoot.TrimEnd('\') }
     $paths = @($Paths | ForEach-Object { $_.Trim().TrimStart([char]0xFEFF) } | Where-Object { $_ })
@@ -514,6 +515,8 @@ function New-PRPlan {
                 $cand = PR-ParseShow $stem.Substring(0, $mstart)
                 if (-not $cand.Title -and $rel.Count -gt 1) { $cand = PR-ParseShow $rel[0] }
                 $key2 = (PR-Norm $cand.Title) + '|' + $cand.Year
+                $row.group_key = 'show|' + $key2; $row.query = "$($cand.Title)|$($cand.Year)"
+                if ($Force.ContainsKey($row.group_key) -and -not $shows.ContainsKey($key2)) { $fc = $Force[$row.group_key]; $shows[$key2] = @{ Provider = [string]$fc.Provider; Id = $fc.Id; Name = (PR-Safe ([string]$fc.Title)); Year = $fc.Year; Sim = 1.0 } }
                 if (-not $shows.ContainsKey($key2)) {
                     $shows[$key2] = PR-MatchShow $Db $cand.Title $cand.Year
                     if (-not $shows[$key2] -and $rel.Count -gt 1) { $f = PR-ParseShow $rel[0]; $shows[$key2] = PR-MatchShow $Db $f.Title $f.Year }
@@ -577,11 +580,20 @@ function New-PRPlan {
                         if ($fp.Year -and $fp.Title -and ((PR-Sim $fp.Title $pm.Title) -ge 0.7 -or (PR-Norm $fp.Title).StartsWith((PR-Norm $pm.Title), [StringComparison]::Ordinal) -or (PR-Norm $pm.Title).StartsWith((PR-Norm $fp.Title), [StringComparison]::Ordinal))) { $pm.Year = $fp.Year; $folderYear = $true }
                     }
                 }
-                $mm = $null; if ($pm.Title) { $mm = PR-MatchMovie $Db $pm.Title $pm.Year }
-                if (-not $mm) { $yr = 'None'; if ($pm.Year) { $yr = $pm.Year }; $row.note = "unmatched: no TMDB movie for `"$($pm.Title)`" ($yr)"; $rows.Add($row); continue }
+                $row.group_key = 'movie|' + $p.ToLowerInvariant(); $row.query = "$($pm.Title)|$($pm.Year)"
+                $mm = $null
+                if ($Force.ContainsKey($row.group_key)) { $fc = $Force[$row.group_key]; $mm = @{ Provider = [string]$fc.Provider; Id = $fc.Id; Title = (PR-Safe ([string]$fc.Title)); Year = $fc.Year; Conf = 'low'; Note = "chosen by you: `"$($fc.Title)`" ($($fc.Year))" } }
+                elseif ($pm.Title) { $mm = PR-MatchMovie $Db $pm.Title $pm.Year }
+                $loose = $FolderLoose -and ((PR-Dir $p).TrimEnd('\').ToLowerInvariant() -eq $mroot.ToLowerInvariant())
+                if (-not $mm) {
+                    $yr = 'None'; if ($pm.Year) { $yr = $pm.Year }; $row.note = "unmatched: no TMDB movie for `"$($pm.Title)`" ($yr)"
+                    if ($loose -and $pm.Title) { $fd = PR-Safe $pm.Title; if ($pm.Year) { $fd = PR-Safe "$($pm.Title) ($($pm.Year))" }; $row.fold_path = PR-Join $mroot $fd (PR-Base $p) }   # still give a loose file its own folder (name kept)
+                    $rows.Add($row); continue
+                }
                 $base = PR-Safe "$(PR-StripYear ([string]$mm.Title)) ($($mm.Year))"
                 if ((-not $FolderLoose) -and ((PR-Dir $p).TrimEnd('\').ToLowerInvariant() -eq $mroot.ToLowerInvariant())) { $row.new_path = PR-Join $mroot ($base + $ext) } else { $row.new_path = PR-Join $mroot $base ($base + $ext) }   # option off: a movie loose in the library root is only renamed, not put into its own folder
                 $row.tmdb_id = $(if ($mm.Provider -eq 'tvdb') { 'tvdb:' + [string]$mm.Id } else { [string]$mm.Id }); $row.confidence = $mm.Conf; $row.note = $mm.Note
+                if ($loose) { $row.fold_path = PR-Join $mroot $base (PR-Base $p) }   # folder-only move (name kept), used when the rename itself is not applied (low confidence with high-only, or a clash)
                 if ($folderYear) { $row.note += "; year $($pm.Year) taken from the folder name" }
                 if ($mm.Ambig) { $ambig[$p] = $true }
             } else {
@@ -608,7 +620,7 @@ function New-PRPlan {
     Save-PRTmdbCache $Db
     # collisions / already-correct. high-confidence first, then by lowercase path (ordinal), stable
     $existing = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($p in $paths) { [void]$existing.Add($p.ToLowerInvariant()) }
+    foreach ($p in @($paths) + @($OtherPaths)) { if ($p) { [void]$existing.Add($p.ToLowerInvariant()) } }
     $idx = 0; $keyed = foreach ($r in $rows) { $k = '1'; if ($r.confidence -eq 'high') { $k = '0' }; [pscustomobject]@{ K = $k; P = $r.old_path.ToLowerInvariant(); I = $idx++; R = $r } }
     $arr = [object[]]@($keyed)
     [Array]::Sort($arr, [Comparison[object]]{ param($a, $b)
@@ -647,12 +659,19 @@ function New-PRPlan {
             else { $c = [string]::CompareOrdinal($a.K[$i], $b.K[$i]); if ($c -ne 0) { return $c } }
         }
         return $a.K.Count.CompareTo($b.K.Count) })
+    # sidecars left behind in folders with no video come last, so the ones next to (or in Subs under) their video get the plain names first
+    $hasVid = { param($q) $dq = (PR-Dir $q).ToLowerInvariant(); if ($vidByDir.ContainsKey($dq)) { return $true }; if ((PR-Base $dq) -eq 'subs') { return $vidByDir.ContainsKey((PR-Dir $dq).ToLowerInvariant()) }; return $false }
+    $sorted = [object[]](@($sorted | Where-Object { & $hasVid $_.P }) + @($sorted | Where-Object { -not (& $hasVid $_.P) }))
     $sn = 0
     foreach ($item in $sorted) {
         $sn++; if ($sn % 50 -eq 0) { PR-Progress $sn $sorted.Count 'Matching subtitles' }
         $p = $item.P; $d = PR-Dir $p; $fn = PR-Base $p; $parts = $d.Split('\')
         $row = PR-NewRow $p; $row.media_type = 'sidecar'
-        $v = $null; $suffix = $null
+        if ($script:PR_DELETE_NFO -and (PR-SplitExt $fn)[1] -ieq '.nfo') {   # Setup: Delete .nfo files during Full Run - not renamed or re-attached
+            if (PR-NfoAllowed $p @($MoviesRoot, $SeriesRoot)) { $row.note = 'nfo: delete (sent to the Recycle Bin on Full Run)' } else { $row.note = 'nfo: kept (protected or hidden folder)' }
+            $rows.Add($row); continue
+        }
+        $v = $null; $suffix = $null; $how = ''; $subsUnd = $false; $untagged = $false
         $cands = @(); if ($vidByDir.ContainsKey($d.ToLowerInvariant())) { $cands = @($vidByDir[$d.ToLowerInvariant()] | Where-Object { $fn.ToLowerInvariant().StartsWith((PR-SplitExt (PR-Base $_.old_path))[0].ToLowerInvariant(), [StringComparison]::Ordinal) }) }
         $last2 = @($parts | Select-Object -Last 2 | ForEach-Object { $_.ToLowerInvariant() })
         if ($cands.Count -gt 0) {
@@ -671,23 +690,86 @@ function New-PRPlan {
                 }
             }
             if ($pv.Count -eq 1) {
-                $v = $pv[0]; $ls = PR-LangSuffix (PR-SplitExt $fn)[0]
-                if ($ls) { $suffix = $ls + (PR-SplitExt $fn)[1].ToLowerInvariant() } else { $row.note = 'sidecar: unknown language in name; left in place' }
+                $v = $pv[0]; $ls = PR-SubsLang (PR-SplitExt $fn)[0]; $how = 'subs'
+                if (-not $ls) { $ls = PR-LangSuffix (PR-SplitExt $fn)[0] }
+                if ($ls) { $suffix = $ls + (PR-SplitExt $fn)[1].ToLowerInvariant() } else { $suffix = '.und' + (PR-SplitExt $fn)[1].ToLowerInvariant(); $subsUnd = $true }
+            }
+        }
+        $reattach = ''; $rhigh = $true; $why = ''
+        if (-not $v -and -not $row.note) {
+            # orphan sidecar (its video was renamed earlier, or it was left behind in an old folder): re-attach it
+            $inDir = @(); if ($vidByDir.ContainsKey($d.ToLowerInvariant()) -and $d.TrimEnd('\').ToLowerInvariant() -ne ([string]$mroot).TrimEnd('\').ToLowerInvariant()) {   # never tie a loose file in the library root to another loose video
+                $inDir = $vidByDir[$d.ToLowerInvariant()].ToArray() }
+            $pick = $null
+            $sp = PR-ParseMovie (PR-SidecarStem $fn)
+            if ($inDir.Count -eq 1) { $pick = $inDir[0]; $reattach = 'one' }
+            elseif ($inDir.Count -gt 1) {
+                $tm = PR-TitleMatch $sp $inDir
+                if ($tm) { $pick = $tm.V; $reattach = 'title'; $rhigh = $tm.Year; $why = $(if ($tm.Year) { ': same title and year' } else { ': same title, year differs - verify' }) }
+            } else {
+                # no video here: look for the movie elsewhere (by the sidecar's own name, then by its folder name)
+                $fold = $parts[-1]; if ($fold -ieq 'subs' -and $parts.Count -ge 2) { $fold = $parts[-2] }
+                $allMov = @($vids.Values | Where-Object { $_.media_type -eq 'movie' })
+                $tm = $null; if ($sp.Title -and $sp.Year) { $tm = PR-TitleMatch $sp $allMov }
+                if (-not $tm -and $parts.Count -gt 2) {
+                    $fp = PR-ParseMovie $fold
+                    if (-not $fp.Year) { $fy = [regex]::Match($fold, '^(.+?)[ ._(\[-]+((?:19|20)\d\d)(?!\d)'); if ($fy.Success) { $fp = PR-ParseMovie ($fy.Groups[1].Value + ' ' + $fy.Groups[2].Value) } }   # 'Superman 2025-1080p x265'
+                    $tm = PR-TitleMatch $fp $allMov
+                }
+                if ($tm -and $tm.Year) { $pick = $tm.V; $reattach = 'other'; $rhigh = $false; $why = " in another folder ('" + (PR-Base (PR-Dir $(if ($tm.V.new_path) { $tm.V.new_path } else { $tm.V.old_path }))) + "'): same title and year - verify" }
+                elseif ($tm) { $pick = $tm.V; $reattach = 'other'; $rhigh = $false; $why = " in another folder: same title, year differs - verify" }
+                else { $row.note = 'sidecar: no video found; left in place' }
+            }
+            if ($pick) {
+                $ext = (PR-SplitExt $fn)[1].ToLowerInvariant()
+                $tail = $null
+                if ($parts[-1] -ieq 'subs') { $ls = PR-SubsLang (PR-SplitExt $fn)[0]; if ($ls) { $tail = $ls + $ext } }   # Subs\English.srt, Subs\Español (Latinoamérica).spa.srt
+                if ($null -eq $tail) { $tail = PR-CleanSpacedTags $fn }
+                if ($null -eq $tail) { $tail = PR-SidecarTags $fn }
+                if ($null -eq $tail) { $tail = $ext; $untagged = $true }
+                $v = $pick; $suffix = $tail; $how = 'reattach'
             }
         }
         if ($v -and $suffix) {
             $base = $v.new_path; if (-not $base) { $base = $v.old_path }
             $np = (PR-SplitExt $base)[0] + $suffix
             $row.tmdb_id = $v.tmdb_id; $row.confidence = $v.confidence; if (-not $row.confidence) { $row.confidence = 'high' }
+            if (($reattach -and -not $rhigh) -or $subsUnd) { $row.confidence = 'low' }   # matched by title only / another folder / unknown language: reviewed
+            $row.group_key = $v.group_key
+            if ($row.confidence -eq 'low' -and $how) { $row.group_key = 'sc|' + $p.ToLowerInvariant() }   # its own Accept tick (the video may already be done)
+            $numbered = $false
+            if ($how) {
+                $bs = (PR-SplitExt $base)[0]; $tg = $suffix.Substring(0, $suffix.Length - (PR-SplitExt ('x' + $suffix))[1].Length); $ex = $suffix.Substring($tg.Length)
+                $plain = $bs + $tg + $ex; $pl = $plain.ToLowerInvariant(); $occ = $null
+                if ($taken.ContainsKey($pl)) { $occ = [string]$taken[$pl] } elseif ($existing.Contains($pl) -and $pl -ne $p.ToLowerInvariant()) { $occ = $plain }
+                if ($occ -and (Test-PRSameSidecar $p $occ)) { $np = $plain }   # an extra copy of what is already there: skipped as a DUPLICATE below
+                else { $np = PR-FreeTarget $bs $tg $ex $p $taken $existing; if ($np -cne $plain) { $numbered = $true; $row.confidence = 'low'; $row.group_key = 'sc|' + $p.ToLowerInvariant() } }   # a different track under a new name: reviewed, never automatic
+            }
+            if ($v.fold_path) { $row.fold_path = PR-Join (PR-Dir $v.fold_path) $fn }   # loose subtitle follows its video into the folder
             if ($taken.ContainsKey($np.ToLowerInvariant()) -or ($existing.Contains($np.ToLowerInvariant()) -and $np.ToLowerInvariant() -ne $p.ToLowerInvariant())) { $row.note = 'DUPLICATE sidecar target (same language already placed); left in place' }
             elseif ($np -ceq $p) { $row.note = 'sidecar already correctly named' }
             else {
                 $row.new_path = $np; $taken[$np.ToLowerInvariant()] = $p
                 $row.note = 'sidecar of ' + (PR-Base $v.old_path); if (-not $v.new_path) { $row.note += ' (video not moved)' }
+                if ($reattach) { $row.note = 'sidecar (re-attached) of ' + (PR-Base $v.old_path) + $(if ($reattach -eq 'one') { ': the only video in this folder' } else { $why }) }
+                elseif ($how -eq 'subs') { $row.note = 'sidecar (moved up from Subs) of ' + (PR-Base $v.old_path) + $(if ($subsUnd) { '; language not recognised - verify' } else { '' }) }
+                if ($untagged) { $row.note += '; no language tag (kept untagged)' }
+                if ($numbered) { $row.note += '; numbered: ' + (PR-Base $plain) + ' already exists with different content - verify' }
             }
         } elseif (-not $row.note) { $row.note = 'sidecar: no matching video; left in place' }
         $rows.Add($row)
     }
+    # rows whose only change is a folder's letter case: one row per folder (its video if it has one) carries the folder note and is the one listed
+    $caseRep = @{}
+    foreach ($pass in 1, 2) { foreach ($r in $rows) { if (Test-PRCaseOnly $r) { $k = (PR-CaseFolderPair $r.old_path $r.new_path)[1].ToLowerInvariant(); if (-not $caseRep.ContainsKey($k) -and ($pass -eq 2 -or $r.media_type -ne 'sidecar')) { $caseRep[$k] = $r } } } }
+    foreach ($r in $rows) {
+        if (-not (Test-PRCaseOnly $r)) { continue }
+        $pr = PR-CaseFolderPair $r.old_path $r.new_path
+        if ([object]::ReferenceEquals($caseRep[$pr[1].ToLowerInvariant()], $r)) { $r.case_rep = '1'; $r.note = ("folder renamed: '{0}' -> '{1}'; " -f (PR-Base $pr[0]), (PR-Base $pr[1])) + $r.note }
+        elseif ($r.media_type -eq 'sidecar') { $r.note = ([string]$r.note).TrimEnd() + ' (folder case fix)' }
+        else { $r.note = 'folder case fix; ' + $r.note }
+    }
+    if ($Force.Count) { foreach ($r in $rows) { if ($r.group_key -and $Force.ContainsKey($r.group_key) -and $r.new_path) { $r.accepted = 'yes'; $r.confidence = 'low'; if ($r.media_type -eq 'episode') { $r.note = 'chosen by you; ' + $r.note } }  } }   # a match the user picked counts as accepted
     PR-Progress 1 1 'Done'
     return ,$rows.ToArray()
 }
@@ -696,6 +778,88 @@ function PR-EpCode($em) {
     return "$([int]$em.Groups[4].Value)|$([int]$em.Groups[5].Value)"
 }
 function PR-EpCodeOf([string]$path) { $mm = $script:PR_EP.Match((PR-SplitExt (PR-Base $path))[0]); if ($mm.Success) { return (PR-EpCode $mm) }; return $null }
+# trailing language / flag tags of an orphan sidecar name, kept as written: 'X.eng.CC.srt' -> '.eng.CC.srt', 'X.fra.forced.srt' -> '.fra.forced.srt',
+# 'X.spa.Latinoamérica.srt' -> '.spa.Latinoamérica.srt'; .nfo -> '.nfo'. $null when a subtitle has no language tag.
+function PR-SidecarTags([string]$fn) {
+    $se = PR-SplitExt $fn; $ext = $se[1].ToLowerInvariant()
+    if ($ext -eq '.nfo') { return '.nfo' }
+    $seg = $se[0].Split('.'); $flags = @('sdh', 'hi', 'cc', 'forced', 'default', 'hearing', 'impaired')
+    $isLang = { param($w) $l = $w.ToLowerInvariant(); $script:PR_LANG.ContainsKey($l) -or ($script:PR_LANG.Values -contains $l) -or ($w -cmatch '^[a-z]{2,3}$') }   # known language, or a short lowercase code (hin, tam)
+    $keep = New-Object System.Collections.Generic.List[string]; $hasLang = $false
+    for ($i = $seg.Count - 1; $i -ge 1; $i--) {
+        $w = $seg[$i]
+        if ($flags -contains $w.ToLowerInvariant()) { $keep.Insert(0, $w); continue }
+        if (& $isLang $w) { $keep.Insert(0, $w); $hasLang = $true; continue }
+        if ($w -cmatch '^\p{Lu}\p{L}{1,19}$' -and $i -ge 2 -and (& $isLang $seg[$i - 1])) { $keep.Insert(0, $w); continue }   # region after a language: fra.Canada, spa.Latinoamérica
+        break
+    }
+    if (-not $hasLang) { return $null }
+    return '.' + ($keep -join '.') + $ext
+}
+function PR-SidecarStem([string]$fn) { $t = PR-SidecarTags $fn; $s = (PR-SplitExt $fn)[0]; if ($t -and $t -ne '.nfo') { $n = $t.Length - (PR-SplitExt $fn)[1].Length; if ($n -gt 0 -and $s.Length -gt $n) { $s = $s.Substring(0, $s.Length - $n) } }; return $s }
+# title + year match of a parsed name against videos (Part II = Part 2); returns @{V; Year} for exactly one title match, preferring the one whose year matches
+function PR-TitleKey([string]$t) {
+    $rm = @{ i = '1'; ii = '2'; iii = '3'; iv = '4'; v = '5'; vi = '6'; vii = '7'; viii = '8'; ix = '9'; x = '10' }
+    $w = @((PR-Norm $t).Split(' ') | Where-Object { $_ -and $_ -ne 'part' } | ForEach-Object { if ($rm.ContainsKey($_)) { $rm[$_] } else { $_ } })
+    return ($w -join ' ')
+}
+function PR-TitleMatch($sp, $videos) {
+    if (-not $sp -or -not $sp.Title) { return $null }
+    $k = PR-TitleKey $sp.Title; if (-not $k) { return $null }
+    $hits = @(); foreach ($x in $videos) { $vb = $x.new_path; if (-not $vb) { $vb = $x.old_path }; $vp = PR-ParseMovie (PR-SplitExt (PR-Base $vb))[0]; if ($vp.Title -and (PR-TitleKey $vp.Title) -eq $k) { $hits += [pscustomobject]@{ V = $x; Y = $vp.Year } } }
+    $yh = @($hits | Where-Object { $sp.Year -and $_.Y -and [int]$_.Y -eq [int]$sp.Year })
+    if ($yh.Count -eq 1) { return @{ V = $yh[0].V; Year = $true } }
+    if ($yh.Count -eq 0 -and $hits.Count -eq 1) { return @{ V = $hits[0].V; Year = $false } }
+    return $null
+}
+# language from a free-form name: 'English', '3_English', 'Español (Latinoamérica)', 'français (Canada)', 'eng CC', 'Forced' ...
+# returns '.en', '.es-419', '.fr-CA', '.en.sdh', '.en.forced' (same 2-letter codes as the rest of Renamr), or $null
+$script:PR_NATIVE = @{ 'español' = 'es'; 'espanol' = 'es'; 'castellano' = 'es'; 'français' = 'fr'; 'francais' = 'fr'; 'deutsch' = 'de'; 'português' = 'pt'; 'portugues' = 'pt';
+  'italiano' = 'it'; 'nederlands' = 'nl'; 'polski' = 'pl'; 'svenska' = 'sv'; 'norsk' = 'no'; 'dansk' = 'da'; 'suomi' = 'fi'; 'türkçe' = 'tr'; 'magyar' = 'hu';
+  'čeština' = 'cs'; 'русский' = 'ru'; 'ελληνικά' = 'el'; 'עברית' = 'he'; 'العربية' = 'ar'; '日本語' = 'ja'; '中文' = 'zh'; '한국어' = 'ko' }
+$script:PR_REGION = @{ 'latinoamérica' = '419'; 'latinoamerica' = '419'; 'latino' = '419'; 'latam' = '419'; 'latin' = '419'; 'canada' = 'CA'; 'canadien' = 'CA'; 'québec' = 'CA'; 'quebec' = 'CA';
+  'portugal' = 'PT'; 'brasil' = 'BR'; 'brazil' = 'BR'; 'brasileiro' = 'BR'; 'españa' = 'ES'; 'spain' = 'ES'; 'castilian' = 'ES'; 'european' = 'ES' }
+function PR-SubsLang([string]$name) {
+    $words = @([regex]::Matches($name.ToLowerInvariant(), '\p{L}+') | ForEach-Object { $_.Value })
+    $code = $null; foreach ($w in $words) { if ($script:PR_LANG.ContainsKey($w)) { $code = $script:PR_LANG[$w]; break }; if ($script:PR_NATIVE.ContainsKey($w)) { $code = $script:PR_NATIVE[$w]; break } }
+    if (-not $code) { return $null }
+    if ($code -notmatch '-') { foreach ($w in $words) { if ($script:PR_REGION.ContainsKey($w)) { $rg = $script:PR_REGION[$w]; if ($rg -eq '419' -and $code -ne 'es') { continue }; if ($rg -eq 'CA' -and $code -ne 'fr' -and $code -ne 'en') { continue }; if (($rg -eq 'PT' -or $rg -eq 'BR') -and $code -ne 'pt') { continue }; if ($rg -eq 'ES' -and $code -ne 'es') { continue }; $code = $code + '-' + $rg; break } } }
+    $flags = @(); if ($words -contains 'forced') { $flags += 'forced' }
+    if ($words -contains 'sdh' -or $words -contains 'cc' -or ($words -contains 'hi') -or ($words -contains 'hearing')) { $flags += 'sdh' }
+    return '.' + ((@($code) + $flags) -join '.')
+}
+# tag block written with spaces between tokens ('X.eng.CC eng.srt', 'X.fra.Canada fre.srt'): a clean tag ('.en.sdh.srt', '.fr-CA.srt'); $null when the block has no space
+function PR-CleanSpacedTags([string]$fn) {
+    $se = PR-SplitExt $fn; $ext = $se[1].ToLowerInvariant(); if ($ext -eq '.nfo') { return $null }
+    $seg = $se[0].Split('.'); $flags = @('sdh', 'hi', 'cc', 'forced', 'default', 'hearing', 'impaired')
+    $ok = { param($t) $l = $t.ToLowerInvariant(); ($flags -contains $l) -or $script:PR_LANG.ContainsKey($l) -or ($script:PR_LANG.Values -contains $l) -or $script:PR_NATIVE.ContainsKey($l) -or $script:PR_REGION.ContainsKey($l) }
+    $blk = New-Object System.Collections.Generic.List[string]; $spaced = $false
+    for ($i = $seg.Count - 1; $i -ge 1; $i--) {
+        $tk = @($seg[$i].Split(' ') | Where-Object { $_ }); if ($tk.Count -eq 0) { break }
+        $all = $true; foreach ($t in $tk) { if (-not (& $ok $t)) { $all = $false; break } }
+        if (-not $all) { break }
+        if ($tk.Count -gt 1) { $spaced = $true }; $blk.Insert(0, ($tk -join ' '))
+    }
+    if (-not $spaced) { return $null }
+    $t = PR-SubsLang ($blk -join ' '); if (-not $t) { return $null }
+    return $t + $ext
+}
+# first free name: base+tag+ext, then (untagged) base.und+ext, then base+tag.2+ext, .3 ... never an existing or already planned file
+# is sidecar $a just another copy of $b? .nfo: always (one .nfo per video); subtitles: identical bytes, or sizes within 3% (same language and flags, since the names match)
+function Test-PRSameSidecar([string]$a, [string]$b) {
+    if ((PR-SplitExt $a)[1] -ieq '.nfo') { return $true }
+    try { $fa = Get-Item -LiteralPath $a -ErrorAction Stop; $fb = Get-Item -LiteralPath $b -ErrorAction Stop } catch { return $false }
+    if ($fa.Length -eq $fb.Length -and (Get-FileHash -LiteralPath $a -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $b -Algorithm SHA256).Hash) { return $true }
+    $big = [math]::Max($fa.Length, $fb.Length); if ($big -eq 0) { return $true }
+    return ([math]::Abs($fa.Length - $fb.Length) / $big) -le 0.03
+}
+function PR-FreeTarget([string]$bs, [string]$tg, [string]$ex, [string]$self, $taken, $existing) {
+    $free = { param($c) $l = $c.ToLowerInvariant(); -not $taken.ContainsKey($l) -and (-not $existing.Contains($l) -or $l -eq $self.ToLowerInvariant()) }
+    $c = $bs + $tg + $ex; if (& $free $c) { return $c }
+    if (-not $tg -and $ex -ne '.nfo') { $tg = '.und'; $c = $bs + $tg + $ex; if (& $free $c) { return $c } }
+    for ($n = 2; $n -lt 100; $n++) { $c = $bs + $tg + '.' + $n + $ex; if (& $free $c) { return $c } }
+    return $bs + $tg + $ex
+}
 function PR-LangSuffix([string]$name) {
     $words = @([regex]::Matches($name.ToLowerInvariant(), '[a-z]+') | ForEach-Object { $_.Value })
     $code = $null; foreach ($w in $words) { if ($script:PR_LANG.ContainsKey($w)) { $code = $script:PR_LANG[$w]; break } }
@@ -704,14 +868,28 @@ function PR-LangSuffix([string]$name) {
     if ($words -contains 'hi' -and -not ($words -contains 'sdh')) { $flags += 'sdh' }
     return '.' + ((@($code) + $flags) -join '.')
 }
+# one line that explains the 'Unmatched / left in place' view
+function Get-PRUnmatchedLine($rows) {
+    $m = 0; $e = 0; $eNoSeries = 0; $s = 0
+    foreach ($r in $rows) {
+        if ($r.new_path -or $r.fold_path) { continue }
+        $n = [string]$r.note
+        if ($r.media_type -eq 'sidecar') { if ($n -like 'sidecar: *') { $s++ } }
+        elseif ($n.StartsWith('unmatched')) { if ($r.media_type -eq 'episode') { $e++; if ($n -like '*no Series folder selected*') { $eNoSeries++ } } else { $m++ } }
+    }
+    $line = "Unmatched: $m movie(s), $e episode(s), $s sidecar(s) with no video."
+    if ($eNoSeries) { $line += " $eNoSeries episode(s) are in the Movies folder but no Series folder is set: choose a Series folder to rename them (they are not moved now)." }
+    return $line
+}
 function Get-PRSummary($rows) {
-    $t = 0; $h = 0; $l = 0; $s = 0; $a = 0
+    $t = 0; $h = 0; $s = 0; $a = 0; $rc = Get-PRReviewCounts $rows; $cf = @{}
     foreach ($r in $rows) {
         $t++
-        if ($r.new_path) { if ($r.confidence -eq 'high') { $h++ } elseif ($r.confidence -eq 'low') { $l++ } } else { $s++ }
+        if (Test-PRCaseOnly $r) { $cf[(PR-CaseFolderPair $r.old_path $r.new_path)[1].ToLowerInvariant()] = 1 }
+        elseif ($r.new_path) { if ($r.confidence -eq 'high') { $h++ } } else { $s++ }
         if ($r.note -like '*already correctly named*') { $a++ }
     }
-    return "Result: $h ready to rename (high confidence), $l to review (low confidence), $s left as they are (unmatched or no change needed; $a already correctly named), $t total."
+    return "Result: $h ready to rename (high confidence), $($cf.Count) folder name(s) to fix (letter case), $($rc.Total) movie(s)/show(s) to review ($($rc.Low) low-confidence matches, $($rc.NoMatch) with no match), $s file(s) left as they are (unmatched or no change needed; $a already correctly named), $t total."
 }
 
 # ---------- file system scan ----------
@@ -741,7 +919,107 @@ function Export-PRCsv($rows, [string]$path, [string[]]$columns) {
         foreach ($r in $rows) { $sw.Write((($columns | ForEach-Object { PR-CsvField $r.$_ }) -join ',') + "`r`n") }
     } finally { $sw.Close() }
 }
-function Export-PRPlan($rows, [string]$path) { Export-PRCsv $rows $path @('old_path','new_path','media_type','tmdb_id','confidence','note') }
+function Export-PRPlan($rows, [string]$path) { Export-PRCsv $rows $path @('old_path','new_path','media_type','tmdb_id','confidence','note','fold_path','accepted','group_key') }
+# where a Full Run puts a row: the planned rename, or for a loose movie whose rename is not applied, just its own folder (name kept)
+# Setup option "Full Run applies only ticked rows": off = high-confidence + accepted + folder-only moves (default); on = only rows ticked Accept
+$script:PR_ONLY_TICKED = $false
+function PR-ApplyTarget($r, [bool]$HighOnly) {
+    if ($script:PR_ONLY_TICKED) {
+        if (-not ($r.PSObject.Properties['accepted'] -and $r.accepted -eq 'yes')) { return '' }
+        if ($r.new_path) { return [string]$r.new_path }
+        if ($r.PSObject.Properties['fold_path'] -and $r.fold_path) { return [string]$r.fold_path }
+        return ''
+    }
+    if ($r.new_path -and (-not $HighOnly -or $r.confidence -eq 'high' -or ($r.PSObject.Properties['accepted'] -and $r.accepted -eq 'yes'))) { return [string]$r.new_path }
+    if ($r.PSObject.Properties['fold_path'] -and $r.fold_path) { return [string]$r.fold_path }
+    return ''
+}
+# counts for the Full Run confirmation: High = renamed as high confidence (or everything when not high-only), Accepted = low ones you accepted, Folder = only put into their own folder
+# a row whose only change is the letter case of a folder (the file name itself is already right)
+function Test-PRCaseOnly($r) { $o = [string]$r.old_path; $n = [string]$r.new_path; return ([bool]$n -and $o -ieq $n -and $o -cne $n -and (PR-Base $o) -ceq (PR-Base $n)) }
+function PR-CaseFolderPair([string]$o, [string]$n) {
+    # first folder whose case differs: returns @(old full folder, new full folder)
+    $a = $o.Split([char]92); $b = $n.Split([char]92)
+    for ($i = 0; $i -lt [math]::Min($a.Count, $b.Count) - 1; $i++) { if ($a[$i] -cne $b[$i]) { return @((($a[0..$i]) -join '\'), (($b[0..$i]) -join '\')) } }
+    return @((PR-Dir $o), (PR-Dir $n))
+}
+function Get-PRRunCounts($Rows, [bool]$HighOnly) {
+    # High / Accepted / Folder count files; CaseFolders counts folders (one per folder, not per file); Total = files that really move
+    $c = @{ High = 0; Accepted = 0; Folder = 0; Total = 0; CaseFolders = 0 }; $cf = @{}
+    foreach ($r in $Rows) {
+        $t = PR-ApplyTarget $r $HighOnly; if (-not $t) { continue }
+        if ($t -ceq [string]$r.new_path -and (Test-PRCaseOnly $r)) { $cf[(PR-CaseFolderPair $r.old_path $r.new_path)[1].ToLowerInvariant()] = 1; continue }
+        $c.Total++
+        if ($t -cne [string]$r.new_path) { $c.Folder++ } elseif ((-not $HighOnly -and -not $script:PR_ONLY_TICKED) -or $r.confidence -eq 'high') { $c.High++ } else { $c.Accepted++ }
+    }
+    $c.CaseFolders = $cf.Count
+    return $c
+}
+# rows the user can review: a low-confidence match with a rename still pending, or a movie/show that found no match
+# (already-named files, duplicates and clashes have nothing pending, so they are not listed)
+function Test-PRReviewable($r) { return ([bool]$r.group_key -and $r.media_type -ne 'sidecar' -and $r.confidence -ne 'high' -and ([bool]$r.new_path -or ([string]$r.note).StartsWith('unmatched'))) }
+# review counts per movie/show (a show counts once): Low = low-confidence matches, NoMatch = no match found
+function Get-PRReviewCounts($Rows) {
+    $low = @{}; $none = @{}
+    foreach ($r in $Rows) { if (Test-PRReviewable $r) { if ($r.new_path) { $low[$r.group_key] = 1 } else { $none[$r.group_key] = 1 } } }
+    foreach ($k in @($low.Keys)) { $none.Remove($k) }
+    return @{ Low = $low.Count; NoMatch = $none.Count; Total = $low.Count + $none.Count }
+}
+# tick or untick Accept for a whole group (a movie with its subtitles, or every episode of a show)
+# rows whose Accept box can be ticked: every movie/episode row with a pending change (high, low, folder case, folder-only).
+# By default a ticked high or folder-case row is only a visible approval (they are applied anyway); a ticked low row gets its full rename.
+function Test-PRTickable($r) { return ([bool]$r.group_key -and ($r.media_type -ne 'sidecar' -or ([string]$r.group_key).StartsWith('sc|')) -and ([bool]$r.new_path -or ($r.PSObject.Properties['fold_path'] -and [bool]$r.fold_path))) }
+function Set-PRAccepted($Rows, [string]$GroupKey, [bool]$On) {
+    $n = 0; foreach ($r in $Rows) { if ($r.group_key -eq $GroupKey -and ($r.new_path -or ($r.PSObject.Properties['fold_path'] -and $r.fold_path))) { $r.accepted = $(if ($On) { 'yes' } else { '' }); $n++ } }; return $n
+}
+# Accept all / Clear accepts for a set of groups (e.g. what the current filter shows); unmatched groups cannot be accepted
+function Set-PRAcceptedBulk($Rows, [string[]]$GroupKeys, [bool]$On) {
+    $res = @{ Accepted = 0; Skipped = 0 }; $seen = @{}
+    foreach ($k in $GroupKeys) {
+        if (-not $k -or $seen.ContainsKey($k)) { continue }; $seen[$k] = 1
+        $ok = $false; foreach ($r in $Rows) { if ($r.group_key -eq $k -and (Test-PRTickable $r)) { $ok = $true; break } }
+        if (-not $ok) { if ($On) { $res.Skipped++ }; continue }
+        [void](Set-PRAccepted $Rows $k $On); $res.Accepted++
+    }
+    return $res
+}
+# match candidates for a title (already-cached searches cost nothing): newest best first, by name similarity
+function Get-PRCandidates($Db, [string]$Kind, [string]$Title, $Year) {
+    $out = New-Object System.Collections.Generic.List[object]; $seen = @{}
+    if (-not $Title) { return }
+    $path = '/search/movie'; if ($Kind -eq 'show') { $path = '/search/tv' }
+    $ys = @($null); if ($Year) { $ys = @([int]$Year, $null) }
+    foreach ($pv in (PR-Providers $Db $(if ($Kind -eq 'show') { 'tv' } else { 'movie' }))) {
+        foreach ($y in $ys) {
+            $q = @{ query = $Title }
+            if ($Kind -eq 'show') { $q.first_air_date_year = $y } else { $q.primary_release_year = $y; $q.include_adult = 'false' }
+            $resp = $null; try { $resp = PR-Api $Db $pv $path $q } catch { PR-Log "[$pv] search failed for `"$Title`": $($_.Exception.Message)"; continue }
+            foreach ($r in @(@($resp.results) | Where-Object { $_ } | Select-Object -First 8)) {
+                $k = "$pv|$($r.id)"; if ($seen.ContainsKey($k)) { continue }; $seen[$k] = $true
+                if ($Kind -eq 'show') { $nm = [string]$r.name; $ry = PR-Year $r.first_air_date } else { $nm = [string]$r.title; $ry = PR-Year $r.release_date }
+                if (-not $nm) { continue }
+                $ov = ''; if ($r.PSObject.Properties['overview'] -and $r.overview) { $ov = ([string]$r.overview) -replace '\s+', ' '; if ($ov.Length -gt 200) { $ov = $ov.Substring(0, 200) + '...' } }
+                $out.Add([pscustomobject]@{ Provider = $pv; Id = $r.id; Title = $nm; Year = $ry; Overview = $ov; Sim = [math]::Round((PR-Sim $Title $nm), 2) })
+            }
+        }
+    }
+    $arr = [object[]]$out.ToArray()
+    $sorted = @($arr | Sort-Object -Property @{ Expression = { $_.Sim }; Descending = $true }, @{ Expression = { if ($Year -and $_.Year -eq [int]$Year) { 0 } else { 1 } } })
+    return $sorted   # callers wrap in @()
+}
+# re-plan one group (a movie, or a whole show) with the match the user chose; the rest of the plan is kept as it is
+function Update-PRPlanGroup($Rows, [string]$GroupKey, $Choice, $Db, [string]$MoviesRoot, [string]$SeriesRoot, [bool]$ProbeReal = $false, [bool]$FolderLoose = $true) {
+    $mine = @($Rows | Where-Object { $_.group_key -eq $GroupKey })
+    if ($mine.Count -eq 0) { return ,@($Rows) }
+    $others = @($Rows | Where-Object { $_.group_key -ne $GroupKey })
+    $new = New-PRPlan -Paths @($mine | ForEach-Object { $_.old_path }) -MoviesRoot $MoviesRoot -SeriesRoot $SeriesRoot -Db $Db -ProbeReal $ProbeReal -FolderLoose $FolderLoose -Force @{ $GroupKey = $Choice } -OtherPaths @($others | ForEach-Object { $_.old_path })   # New-PRPlan returns the row array as one object
+    $used = @{}; foreach ($o in $others) { foreach ($t in $o.new_path, $o.fold_path) { if ($t) { $used[$t.ToLowerInvariant()] = $o.old_path } } }
+    foreach ($r in $new) { if ($r.new_path -and $used.ContainsKey($r.new_path.ToLowerInvariant())) { $r.note = "DUPLICATE: same target as $($used[$r.new_path.ToLowerInvariant()]); " + $r.note; $r.new_path = ''; $r.accepted = '' } }
+    $byOld = @{}; foreach ($r in $new) { $byOld[$r.old_path.ToLowerInvariant()] = $r }
+    $res = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $Rows) { $k = $r.old_path.ToLowerInvariant(); if ($r.group_key -eq $GroupKey -and $byOld.ContainsKey($k)) { $res.Add($byOld[$k]) } else { $res.Add($r) } }
+    return ,$res.ToArray()
+}
 
 # ---------- apply / undo (never overwrites) ----------
 function PR-NativeDir([string]$p) { return [IO.Path]::GetDirectoryName($p) }
@@ -757,17 +1035,159 @@ function PR-MoveKeepTimes([string]$From, [string]$To, [bool]$CaseOnly = $false) 
         if ([IO.File]::GetLastAccessTimeUtc($To) -ne $a) { [IO.File]::SetLastAccessTimeUtc($To, $a) }
     } catch { PR-Log "Note: moved, but could not restore the file times of $To : $($_.Exception.Message)" }
 }
+# ---------- folder letter case and empty folders ----------
+$script:PR_KEEP_DIRS = @('$recycle.bin', 'system volume information', '#recycle', '@eadir', '#snapshot', 'recycler')
+function PR-Forbidden([string]$p) { return ([string]::IsNullOrWhiteSpace($p) -or $p.TrimStart().ToUpperInvariant().StartsWith('Z:')) }   # never touch Z:
+function PR-RootOf([string]$p, [string[]]$Roots) {
+    $best = $null
+    foreach ($r in $Roots) { if (-not $r) { continue }; $rt = $r.TrimEnd('\'); if ($p.StartsWith($rt + '\', [StringComparison]::OrdinalIgnoreCase) -and ($null -eq $best -or $rt.Length -gt $best.Length)) { $best = $rt } }
+    return $best
+}
+function PR-MoveDirCase([string]$From, [string]$To) {
+    # Windows ignores letter case, so a case-only folder rename goes through a temporary name
+    $tmp = $From + '.renametmp' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+    [IO.Directory]::Move($From, $tmp); [IO.Directory]::Move($tmp, $To)
+}
+function PR-FixDirCase([string]$Dir, [string[]]$Roots) {
+    # makes the existing folders under a library root match the letter case of $Dir (the root itself is never renamed)
+    $done = New-Object System.Collections.Generic.List[object]
+    if (PR-Forbidden $Dir) { return $done.ToArray() }
+    $root = PR-RootOf $Dir $Roots; if (-not $root) { return $done.ToArray() }
+    $cur = $root
+    foreach ($part in $Dir.Substring($root.Length + 1).Split('\')) {
+        if (-not $part) { continue }
+        $want = $cur + '\' + $part
+        if (-not [IO.Directory]::Exists($want)) { break }
+        $actual = $null; foreach ($d in [IO.Directory]::GetDirectories($cur, $part)) {   # names cannot contain * or ?, so the name works as a pattern
+            $nm = [IO.Path]::GetFileName($d); if ($nm -ieq $part) { $actual = $nm; break } }
+        if ($actual -and $actual -cne $part) {
+            $from = $cur + '\' + $actual; PR-MoveDirCase $from $want
+            $done.Add([pscustomobject]@{ From = $from; To = $want }); PR-Log "Folder case fixed: $actual -> $part"
+        }
+        $cur = $want
+    }
+    return $done.ToArray()
+}
+# ---------- .nfo clean-up (Setup: Delete .nfo files during Full Run) ----------
+$script:PR_DELETE_NFO = $false
+function PR-SkipDir([string]$Dir) {
+    # hidden / system / reparse folders and the Recycle Bin, System Volume Information, #recycle, @eaDir, #snapshot are never touched
+    try { $at = [IO.File]::GetAttributes($Dir) } catch { return $true }
+    if ($at -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System -bor [IO.FileAttributes]::ReparsePoint)) { return $true }
+    return ($script:PR_KEEP_DIRS -contains ([IO.Path]::GetFileName($Dir)).ToLowerInvariant())
+}
+function PR-NfoAllowed([string]$p, [string[]]$Roots) {
+    if (PR-Forbidden $p) { return $false }
+    $root = PR-RootOf $p @($Roots | Where-Object { $_ -and -not (PR-Forbidden $_) }); if (-not $root -or $root.Length -le 3) { return $false }
+    try { $fa = [IO.File]::GetAttributes($p); if ($fa -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) { return $false } } catch { return $false }
+    $d = PR-NativeDir $p
+    while ($d -and $d.Length -gt $root.Length) { if (PR-SkipDir $d) { return $false }; $d = PR-NativeDir $d }
+    return $true
+}
+function Get-PRNfoFiles([string[]]$Roots) {
+    # every .nfo under the Movies / Series roots that may be deleted (same exclusions as the empty-folder clean-up)
+    $out = New-Object System.Collections.Generic.List[string]; $seen = @{}
+    foreach ($r in $Roots) {
+        if (PR-Forbidden $r) { continue }
+        $rt = $r.TrimEnd('\'); if ($rt.Length -le 3 -or $seen.ContainsKey($rt.ToLowerInvariant()) -or -not [IO.Directory]::Exists($rt)) { continue }
+        $seen[$rt.ToLowerInvariant()] = 1
+        $stack = New-Object System.Collections.Generic.Stack[string]; $stack.Push($rt)
+        while ($stack.Count) {
+            $d = $stack.Pop()
+            try { foreach ($f in [IO.Directory]::GetFiles($d, '*.nfo')) { if ((PR-SplitExt $f)[1] -ieq '.nfo' -and (PR-NfoAllowed $f @($rt))) { $out.Add($f) } } } catch { }
+            try { foreach ($sd in [IO.Directory]::GetDirectories($d)) { if (-not (PR-SkipDir $sd)) { $stack.Push($sd) } } } catch { }
+        }
+    }
+    return $out.ToArray()
+}
+function PR-HasRecycleBin([string]$p) {
+    # only local fixed drives have a Recycle Bin; on a network share or removable drive Windows would delete for good
+    if ($p.StartsWith('\\')) { return $false }
+    try { return ((New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($p))).DriveType -eq [IO.DriveType]::Fixed) } catch { return $false }
+}
+function PR-RecycleFile([string]$p) {
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+}
+function Remove-PRNfoFiles([string[]]$Roots, $Log) {
+    $n = 0; $kept = 0
+    foreach ($f in (Get-PRNfoFiles $Roots)) {
+        if (PR-Cancelled) { break }
+        if (-not (PR-HasRecycleBin $f)) { PR-Log "NFO kept (no Recycle Bin on this drive): $f"; $kept++; continue }
+        try {
+            $parent = PR-NativeDir $f; $pt = PR-TimesOf $parent
+            PR-RecycleFile $f
+            PR-SetTimes $parent $pt
+            $Log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $f; new_path = ''; created_dir = ''; how = 'recycle'; times = '' })
+            PR-Log "NFO sent to the Recycle Bin: $f"; $n++
+        } catch { PR-Log "Could not delete $f : $($_.Exception.Message)" }
+    }
+    return @{ Recycled = $n; Kept = $kept }
+}
+function Get-PRNfoLine($rows) { $n = @($rows | Where-Object { ([string]$_.note).StartsWith('nfo: delete') }).Count; return "NFO files: $n (sent to Recycle Bin on Full Run)" }
+function PR-EmptyWalk([string]$Dir, $Out, [bool]$IsRoot) {
+    # true when $Dir holds no files at all (hidden ones count) and every subfolder is removable too; adds removable folders children-first
+    try {
+        if (-not $IsRoot) {
+            $at = [IO.File]::GetAttributes($Dir)
+            if ($at -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System -bor [IO.FileAttributes]::ReparsePoint)) { return $false }
+            if ($script:PR_KEEP_DIRS -contains ([IO.Path]::GetFileName($Dir)).ToLowerInvariant()) { return $false }
+        }
+        $empty = (@([IO.Directory]::GetFiles($Dir)).Count -eq 0)
+        foreach ($sub in [IO.Directory]::GetDirectories($Dir)) { if (-not (PR-EmptyWalk $sub $Out $false)) { $empty = $false } }
+        if ($empty -and -not $IsRoot) { $Out.Add($Dir) }
+        return $empty
+    } catch { return $false }
+}
+function Get-PREmptyFolders([string[]]$Roots) {
+    # every completely empty folder under the Movies / Series roots, deepest first (the roots themselves are never listed)
+    $out = New-Object System.Collections.Generic.List[string]; $seen = @{}
+    foreach ($r in $Roots) {
+        if (PR-Forbidden $r) { continue }
+        $rt = $r.TrimEnd('\'); if ($rt.Length -le 3 -or $seen.ContainsKey($rt.ToLowerInvariant()) -or -not [IO.Directory]::Exists($rt)) { continue }   # never a drive root
+        $seen[$rt.ToLowerInvariant()] = 1; [void](PR-EmptyWalk $rt $out $true)
+    }
+    return $out.ToArray()   # callers wrap in @()
+}
+function PR-TimesOf([string]$p) { return ('{0}|{1}' -f [IO.Directory]::GetCreationTimeUtc($p).Ticks, [IO.Directory]::GetLastWriteTimeUtc($p).Ticks) }
+function PR-SetTimes([string]$p, [string]$t) {
+    if (-not $t) { return }; $x = $t.Split('|'); if ($x.Count -ne 2) { return }
+    try { [IO.Directory]::SetCreationTimeUtc($p, (New-Object DateTime([long]$x[0], 'Utc'))); [IO.Directory]::SetLastWriteTimeUtc($p, (New-Object DateTime([long]$x[1], 'Utc'))) } catch { }
+}
+function Remove-PREmptyFolders([string[]]$Roots, $Log) {
+    # removes empty folders one by one (Delete without recurse fails on anything not empty); each is added to $Log so Undo recreates it
+    $n = 0
+    foreach ($d in (Get-PREmptyFolders $Roots)) {
+        try {
+            if (@([IO.Directory]::GetFileSystemEntries($d)).Count -ne 0) { continue }
+            $times = PR-TimesOf $d; $parent = PR-NativeDir $d; $pt = PR-TimesOf $parent
+            [IO.Directory]::Delete($d, $false)
+            PR-SetTimes $parent $pt   # the folder above keeps its modified time
+            $Log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $d; new_path = ''; created_dir = ''; how = 'rmdir'; times = $times })
+            PR-Log "Removed empty folder: $d"; $n++
+        } catch { PR-Log "Could not remove empty folder $d : $($_.Exception.Message)" }
+    }
+    return $n
+}
 function Invoke-PRApply {
-    param($Rows, [switch]$HighOnly, [string]$UndoLog)
-    $todo = @($Rows | Where-Object { $_.new_path -and (-not $HighOnly -or $_.confidence -eq 'high') })
+    param($Rows, [switch]$HighOnly, [string]$UndoLog, [string[]]$Roots = @(), [switch]$RemoveEmpty, [switch]$DeleteNfo)
+    $cols = @('moved_at','old_path','new_path','created_dir','how','times'); $fixed = 0; $removed = 0
+    $todo = @($Rows | Where-Object { PR-ApplyTarget $_ ([bool]$HighOnly) })
     $log = New-Object System.Collections.Generic.List[object]
     $moved = 0; $skipped = 0; $failed = 0; $n = 0; $stopped = $false
     foreach ($r in $todo) {
         $n++; PR-Progress $n $todo.Count 'Moving files'
         if (PR-Cancelled) { PR-Log 'Stopped by user.'; $stopped = $true; break }
-        $old = $r.old_path; $new = $r.new_path
+        $old = $r.old_path; $new = PR-ApplyTarget $r ([bool]$HighOnly)
         try {
             if (-not [IO.File]::Exists($old)) { PR-Log "SKIP missing source: $old"; $skipped++; continue }
+            # folders that differ only in letter case are renamed themselves (otherwise the same files come back on every run)
+            foreach ($fx in (PR-FixDirCase (PR-NativeDir $new) $Roots)) {
+                $log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $fx.From; new_path = $fx.To; created_dir = ''; how = 'dircase'; times = '' }); $fixed++
+                if ($old.StartsWith($fx.From + '', [StringComparison]::OrdinalIgnoreCase)) { $old = $fx.To + $old.Substring($fx.From.Length) }
+                Export-PRCsv $log $UndoLog $cols
+            }
+            if ($old.ToLowerInvariant() -eq $new.ToLowerInvariant() -and (PR-Base $old) -ceq (PR-Base $new)) { continue }   # only the folder case differed: done
             $caseOnly = ($old.ToLowerInvariant() -eq $new.ToLowerInvariant())
             if (-not $caseOnly -and ([IO.File]::Exists($new) -or [IO.Directory]::Exists($new))) { PR-Log "SKIP target exists: $new"; $skipped++; continue }
             $dir = PR-NativeDir $new; $created = ''
@@ -777,21 +1197,38 @@ function Invoke-PRApply {
                 [void][IO.Directory]::CreateDirectory($dir)
             }
             PR-MoveKeepTimes $old $new $caseOnly   # never overwrites; keeps the file's timestamps
-            $log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $old; new_path = $new; created_dir = $created })
+            $how = 'rename'; if ($new -ne [string]$r.new_path) { $how = 'folder-only' } elseif ($HighOnly -and $r.confidence -ne 'high') { $how = 'accepted' }
+            $log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $old; new_path = $new; created_dir = $created; how = $how; times = '' })
             $moved++
-            Export-PRCsv $log $UndoLog @('moved_at','old_path','new_path','created_dir')   # incremental so a crash keeps a usable log
+            Export-PRCsv $log $UndoLog $cols   # incremental so a crash keeps a usable log
         } catch { PR-Log "FAILED $old : $($_.Exception.Message)"; $failed++ }
     }
-    $msg = "Moved $moved, skipped $skipped, failed $failed."; if ($stopped) { $msg = "Stopped. " + $msg }; if ($moved) { $msg += " Undo log: $UndoLog" }
+    $nfo = @{ Recycled = 0; Kept = 0 }
+    if ($DeleteNfo -and -not $stopped) { $nfo = Remove-PRNfoFiles $Roots $log; if ($nfo.Recycled) { Export-PRCsv $log $UndoLog $cols } }   # before the empty-folder clean-up, so folders that only held .nfo files go too
+    if ($RemoveEmpty -and -not $stopped) { $removed = Remove-PREmptyFolders $Roots $log; if ($removed) { Export-PRCsv $log $UndoLog $cols } }
+    $msg = "Moved $moved, skipped $skipped, failed $failed."; if ($fixed) { $msg += " Folder letter case fixed: $fixed." }; if ($DeleteNfo) { $msg += " NFO files sent to the Recycle Bin: $($nfo.Recycled)." + $(if ($nfo.Kept) { " NFO files kept (no Recycle Bin on the drive): $($nfo.Kept)." } else { '' }) }; if ($RemoveEmpty) { $msg += " Empty folders removed: $removed." }
+    if ($stopped) { $msg = "Stopped. " + $msg }; if ($log.Count) { $msg += " Undo log: $UndoLog" }
     PR-Log $msg
-    return @{ Moved = $moved; Skipped = $skipped; Failed = $failed; Log = $UndoLog; Cancelled = $stopped }
+    return @{ Moved = $moved; Skipped = $skipped; Failed = $failed; Log = $UndoLog; Cancelled = $stopped; CaseFixed = $fixed; Removed = $removed; NfoRecycled = $nfo.Recycled; NfoKept = $nfo.Kept }
 }
 function Invoke-PRUndo {
     param([string]$UndoLog, [switch]$WhatIf)
     $rows = @(Import-Csv -LiteralPath $UndoLog -Encoding UTF8); [Array]::Reverse($rows)
-    $ok = 0; $skip = 0; $n = 0
+    $ok = 0; $skip = 0; $rec = 0; $n = 0; $made = New-Object System.Collections.Generic.List[object]
     foreach ($r in $rows) {
         $n++; PR-Progress $n $rows.Count 'Undoing'
+        $how = ''; if ($r.PSObject.Properties['how']) { $how = [string]$r.how }
+        if ($how -eq 'recycle') { $rec++; continue }   # a .nfo sent to the Recycle Bin: restore it from there
+        if ($how -eq 'rmdir') {   # a removed empty folder: create it again
+            if ($WhatIf) { PR-Log "recreate $($r.old_path)"; continue }
+            try { if (-not [IO.Directory]::Exists($r.old_path)) { [void][IO.Directory]::CreateDirectory($r.old_path) }; $made.Add($r); $ok++ } catch { PR-Log "FAILED recreate $($r.old_path) : $($_.Exception.Message)"; $skip++ }
+            continue
+        }
+        if ($how -eq 'dircase') {   # a folder whose letter case was changed: change it back
+            if ($WhatIf) { PR-Log "$($r.new_path) -> $($r.old_path)"; continue }
+            try { if ([IO.Directory]::Exists($r.new_path)) { PR-MoveDirCase $r.new_path $r.old_path; $ok++ } else { PR-Log "SKIP not found: $($r.new_path)"; $skip++ } } catch { PR-Log "FAILED $($r.new_path) : $($_.Exception.Message)"; $skip++ }
+            continue
+        }
         if (-not [IO.File]::Exists($r.new_path)) { PR-Log "SKIP not found: $($r.new_path)"; $skip++; continue }
         if (([IO.File]::Exists($r.old_path)) -and $r.old_path.ToLowerInvariant() -ne $r.new_path.ToLowerInvariant()) { PR-Log "SKIP original path occupied: $($r.old_path)"; $skip++; continue }
         if ($WhatIf) { PR-Log "$($r.new_path) -> $($r.old_path)"; continue }
@@ -807,8 +1244,10 @@ function Invoke-PRUndo {
             }
         } catch { PR-Log "FAILED $($r.new_path) : $($_.Exception.Message)"; $skip++ }
     }
+    for ($i = $made.Count - 1; $i -ge 0; $i--) { PR-SetTimes $made[$i].old_path ([string]$made[$i].times) }   # deepest last-created first, so a parent keeps its own time
     PR-Log "Undo: restored $ok, skipped $skip."
-    return @{ Restored = $ok; Skipped = $skip }
+    if ($rec) { PR-Log "$rec .nfo file(s) are in the Recycle Bin - restore from there if needed." }
+    return @{ Restored = $ok; Skipped = $skip; Recycled = $rec }
 }
 
 # ---------- duplicate management (used by the Duplicates dialog) ----------

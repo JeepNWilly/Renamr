@@ -1,6 +1,26 @@
 # Changelog
 The version in `VERSION` is major.minor.patch. `build_exe.ps1` adds a fourth part, the build number, which is stored in `BUILD_NUMBER` and goes up by one on every exe compile.
 
+## 1.4.0
+- **Loose movies get their own folder** even when the file name is already right, or when the rename itself is low confidence: the file is then only moved into its `Name (Year)` folder with its name kept ("folder-only" in the undo log). Its subtitles go with it.
+- **Review and accept:** new **Accept** column and a **Low confidence - review** filter. Tick Accept to include a low-confidence movie or show in the Full Run. **Choose match...** (or double-click a row) opens a picker with the other candidates and a Title / Year search; the pick is applied to the whole movie or show and counts as accepted.
+- **Accept all** / **Clear accepts** act on the rows the current Show filter and Search show (every row with a pending change can be ticked). The log says how many were accepted and how many were skipped because they have no match.
+- **Full Run** always applies high-confidence rows plus any rows you ticked. New Setup option **Full Run applies only ticked rows** (off by default) applies only ticked rows.
+- **Folder letter case:** a folder that differs only in letter case (e.g. `The matrix (1999)` vs `The Matrix (1999)`) is now really renamed (Windows needs a two-step rename). These rows have their own status "folder case" and Show filter **Folder case fixes**, one row per folder. Undo changes the case back.
+- **Empty folders:** new Setup option **Remove empty folders after Full Run** (on by default). Only folders inside the Movies / Series folders that hold no files at all (hidden files count) are removed; hidden, system and recycle folders are never touched, nor is Z:. Scan lists the empty folders now; Undo recreates removed folders with their original times.
+- **Orphan subtitles are re-attached** to their video (for example after the video was renamed earlier):
+  - only video in the folder: renamed to `<video>.<tags>.srt`, keeping the tags as written (`eng.CC`, `fra.Canada`, `hin.sdh`); an untagged one becomes `<video>.srt`;
+  - space-separated tags are cleaned up: `eng.CC eng` → `.en.sdh`, `fra.Canada fre` → `.fr-CA`, `spa.Latinoamérica spa` → `.es-419`;
+  - `Subs\` folders: files such as `3_English.srt` or `Español (Latinoamérica).spa.srt` are moved up next to the video with the language from their name (English and native language names); unknown language → `.und`, low confidence;
+  - several videos in a folder: matched by title and year, with `Part II` = `Part 2`; title only → low confidence;
+  - left behind in an old folder with no video: matched to the movie elsewhere by title and year, always low confidence (review);
+  - a loose subtitle with no video anywhere is left alone ("no video found").
+- **Duplicate sidecars:** when the target name already exists and the file is the same (identical, or same language and size within 3%; a second .nfo always counts), it is skipped as DUPLICATE. A different track gets a numbered name (`.en.2.srt`) and is always low confidence, never applied automatically.
+- **.nfo files:** new Setup option **Delete .nfo files during Full Run** (on by default). All `.nfo` files under the Movies / Series folders are sent to the Windows Recycle Bin (never deleted for good: on a drive without a Recycle Bin they are kept and logged). They show as "nfo: delete" with a Show filter **NFO files to delete**. Runs before the empty-folder clean-up. Logged in the undo log as `recycle`; Undo reports how many are in the Recycle Bin.
+- **Clearer counts:** the scan summary, the review counts and the Full Run confirmation ("Full Run will do now: ...") list each kind of change: high-confidence renames, accepted renames, folder-only moves, folder case fixes, .nfo files and empty folders. The scan log adds "Unmatched: X movies, Y episodes, Z sidecars with no video" and suggests choosing a Series folder when episodes sit in the Movies folder.
+- Running from source (`Renamr.Gui.ps1` in `source\`) uses the app folder's `settings.json`, cache and logs.
+- New tests: `Test-FolderLoose`, `Test-Accept`, `Test-Folders`, `Test-Reattach`, `Test-Nfo`.
+
 ## 1.3.0
 - Setup: new checkbox "Put movies that are not in a folder into their own \"Name (Year)\" folder" (ticked by default, which is how Renamr always behaved). Unticked, a movie sitting directly in the Movies folder is only renamed in place; movies already in a folder are still moved to their Name (Year) folder.
 - Setup: new "Auto Get Subtitles" checkbox (under Get subtitles). When ticked, a Full Run that moved files is followed automatically by the English subtitle lookup and download for those videos, with no extra prompt; a note in Setup explains the service limits (about 200 downloads per hour; it stops cleanly and the next run continues).

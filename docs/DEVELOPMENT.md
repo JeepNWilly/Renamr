@@ -15,7 +15,7 @@ Full details: [source/README.md](../source/README.md).
 1. Edit the engine or GUI. Never edit the generated `Renamr.ps1`.
 2. Run the tests from `source` with Windows PowerShell 5.1, for example:
    `powershell -ExecutionPolicy Bypass -File tests\Test-Remake.ps1`
-   Offline tests: `Test-Parse`, `Test-Remake`, `Test-Duplicates`, `Test-ApplyUndo`, `Test-Tvdb`, `Test-Subtitles`. `Test-GuiSubs` opens the GUI on a temp copy. `Test-Engine` needs a cache file or a live key.
+   Offline tests: `Test-Parse`, `Test-Remake`, `Test-Duplicates`, `Test-ApplyUndo`, `Test-Tvdb`, `Test-Subtitles`, `Test-FolderLoose`, `Test-Accept`, `Test-Folders`, `Test-Reattach`, `Test-Nfo`. Run them all with `Get-ChildItem tests\Test-*.ps1 | ? Name -ne Test-Engine.ps1 | % { powershell -NoProfile -ExecutionPolicy Bypass -File $_.FullName }`. `Test-GuiSubs` opens the GUI on a temp copy. `Test-Engine` needs a cache file or a live key.
 3. Rebuild with `BUILD.cmd` and start the exe to check it opens.
 4. Add a line to `source/CHANGELOG.md` under the current version, and update the docs if behavior changed.
 
@@ -24,3 +24,5 @@ Full details: [source/README.md](../source/README.md).
 - `$Host` is read-only; functions that return lists may need unwrapping with `@(... | ForEach-Object { $_ })`.
 - Run moves from a neutral folder (`Set-Location C:\`) so a folder can be removed.
 - Close the running exe before rebuilding; Windows locks it.
+- Variable names are case-insensitive: a parameter `$Existing` and a local `$existing` are the same variable.
+- `return ,$list` keeps a list as one object; do not wrap such a call in `@()` again.

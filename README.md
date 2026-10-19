@@ -14,6 +14,9 @@ Episodes: <Series>\Show (Year)\Season 01\Show (Year) - S01E01 - Episode Title.ex
 - **Duplicates and multiple versions.** Finds duplicate copies, shades the copy it would keep (green) and the ones it would delete (orange), and lets you choose what to keep. Nothing is deleted unless you choose it.
 - **Remake aware.** Uses the year in the file or folder name; never guesses between same-name films by popularity.
 - **Real resolution** in names, read from the file itself.
+- **Review and accept.** A review filter, an Accept tick per movie/show, Accept all per view, and Choose match to pick the right title. Full Run applies high-confidence rows plus what you ticked.
+- **Tidy folders.** Loose movies get their own folder, folder names that only differ in letter case are fixed, and empty folders are removed (optional; Undo recreates them).
+- **Sidecars follow their video.** Orphan subtitles are re-attached (including `Subs` folders and messy language tags); extra copies are skipped. Optional: send all `.nfo` files to the Recycle Bin.
 - **English subtitles** (optional): standard and SDH/HI, from The Subtitle Database, with an optional automatic mode after each Full Run.
 - Light, dark or system theme. Stop button halts any run cleanly.
 

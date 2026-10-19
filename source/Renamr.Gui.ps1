@@ -14,6 +14,8 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # ---------- locate app folder and engine ----------
 $AppDir = $PSScriptRoot
 if (-not $AppDir) { $AppDir = Split-Path -Parent ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) }
+# running from the source folder: use the app folder above it (settings, API key, cache, logs)
+if ((Split-Path -Leaf $AppDir) -eq 'source' -and -not (Test-Path -LiteralPath (Join-Path $AppDir 'settings.json')) -and (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $AppDir) 'settings.json'))) { $AppDir = Split-Path -Parent $AppDir }
 $EngineCode = $PR_EMBEDDED_ENGINE
 if (-not $EngineCode) {
     foreach ($c in (Join-Path $AppDir 'Renamr.Engine.ps1'), (Join-Path $AppDir 'source\Renamr.Engine.ps1')) {
@@ -30,7 +32,7 @@ $SubsCachePath = Join-Path $AppDir 'subs_cache.json'
 
 # ---------- settings (TMDB key protected with Windows DPAPI for the current user) ----------
 function Load-Settings {
-    $s = @{ MoviesRoot = ''; SeriesRoot = ''; HighOnly = $true; Key = ''; Theme = 'System'; TvdbKey = ''; TvdbPin = ''; Source = 'Movies: TMDB, TV: TVDB'; ProbeAlways = $false; ProbeScan = $true; SubsEnable = $false; SubsStd = $true; SubsSdh = $true; AutoSubs = $false; FolderLoose = $true }
+    $s = @{ MoviesRoot = ''; SeriesRoot = ''; HighOnly = $true; Key = ''; Theme = 'System'; TvdbKey = ''; TvdbPin = ''; Source = 'Movies: TMDB, TV: TVDB'; ProbeAlways = $false; ProbeScan = $true; SubsEnable = $false; SubsStd = $true; SubsSdh = $true; AutoSubs = $false; FolderLoose = $true; RemoveEmpty = $true; OnlyTicked = $false; DeleteNfo = $true }
     if (Test-Path -LiteralPath $SettingsPath) {
         try {
             $j = [IO.File]::ReadAllText($SettingsPath) | ConvertFrom-Json
@@ -44,6 +46,9 @@ function Load-Settings {
             if ($null -ne $j.SubsStd) { $s.SubsStd = [bool]$j.SubsStd }
             if ($null -ne $j.SubsSdh) { $s.SubsSdh = [bool]$j.SubsSdh }
             if ($null -ne $j.FolderLoose) { $s.FolderLoose = [bool]$j.FolderLoose }
+            if ($null -ne $j.RemoveEmpty) { $s.RemoveEmpty = [bool]$j.RemoveEmpty }
+            if ($null -ne $j.OnlyTicked) { $s.OnlyTicked = [bool]$j.OnlyTicked }
+            if ($null -ne $j.DeleteNfo) { $s.DeleteNfo = [bool]$j.DeleteNfo }   # older settings without the key: on
             if ($null -ne $j.AutoSubs) { $s.AutoSubs = [bool]$j.AutoSubs }
             if (@('Movies: TMDB, TV: TVDB', 'TMDB first', 'TVDB first', 'TMDB only', 'TVDB only') -contains $j.Source) { $s.Source = [string]$j.Source }
             if ($j.TvdbKeyProtected) { try { $s.TvdbKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $j.TvdbKeyProtected))) } catch { } }
@@ -61,7 +66,7 @@ function Save-Settings {
     if ($txtKey.Text.Trim()) { $prot = ConvertFrom-SecureString (ConvertTo-SecureString $txtKey.Text.Trim() -AsPlainText -Force) }
     $tk = ''; if ($txtTvdb.Text.Trim()) { $tk = ConvertFrom-SecureString (ConvertTo-SecureString $txtTvdb.Text.Trim() -AsPlainText -Force) }
     $tp = ''; if ($txtPin.Text.Trim()) { $tp = ConvertFrom-SecureString (ConvertTo-SecureString $txtPin.Text.Trim() -AsPlainText -Force) }
-    $o = [ordered]@{ ProbeAlways = $chkProbe.Checked; ProbeScan = $chkScanProbe.Checked; SubsEnable = $chkSubs.Checked; SubsStd = $chkSubStd.Checked; SubsSdh = $chkSubSdh.Checked; AutoSubs = $chkAutoSubs.Checked; FolderLoose = $chkFolderLoose.Checked; Source = [string]$cmbSource.SelectedItem; TvdbKeyProtected = $tk; TvdbPinProtected = $tp; MoviesRoot = $txtMovies.Text.Trim(); SeriesRoot = $txtSeries.Text.Trim(); HighOnly = $chkHigh.Checked; Theme = [string]$cmbTheme.SelectedItem; TmdbKeyProtected = $prot }
+    $o = [ordered]@{ ProbeAlways = $chkProbe.Checked; ProbeScan = $chkScanProbe.Checked; SubsEnable = $chkSubs.Checked; SubsStd = $chkSubStd.Checked; SubsSdh = $chkSubSdh.Checked; AutoSubs = $chkAutoSubs.Checked; FolderLoose = $chkFolderLoose.Checked; RemoveEmpty = $chkRemoveEmpty.Checked; OnlyTicked = $chkOnlyTicked.Checked; DeleteNfo = $chkDeleteNfo.Checked; Source = [string]$cmbSource.SelectedItem; TvdbKeyProtected = $tk; TvdbPinProtected = $tp; MoviesRoot = $txtMovies.Text.Trim(); SeriesRoot = $txtSeries.Text.Trim(); HighOnly = $chkHigh.Checked; Theme = [string]$cmbTheme.SelectedItem; TmdbKeyProtected = $prot }
     [IO.File]::WriteAllText($SettingsPath, ($o | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
 }
 
@@ -127,7 +132,14 @@ $chkAutoSubs = New-Object System.Windows.Forms.CheckBox; $chkAutoSubs.Text = 'Au
 $lblSubLimits = New-Label 'Service limits: the free service allows about 200 subtitle downloads per hour, and lookups are rate-limited too. When a limit is reached, Renamr stops cleanly and tells you roughly when to try again; the next run continues where it left off. Existing subtitle files are never overwritten.' 40 416
 $lblSubLimits.AutoSize = $true; $lblSubLimits.MaximumSize = New-Object System.Drawing.Size(500, 0)
 $lblSetupNote = New-Label 'Keys are stored encrypted for your Windows user. Changes are saved when you close this window.' 16 498
-$btnSetupClose = New-Button 'Close' 454 518 90; $setup.AcceptButton = $btnSetupClose; $setup.CancelButton = $btnSetupClose; $btnSetupClose.DialogResult = 'OK'
+foreach ($c in @($setup.Controls)) { if ($c.Top -ge 260) { $c.Top += 56 } }   # room for the empty-folders and ticked-rows options below the folder option
+$setup.ClientSize = New-Object System.Drawing.Size(560, 614)
+$chkOnlyTicked = New-Object System.Windows.Forms.CheckBox; $chkOnlyTicked.Text = 'Full Run applies only ticked rows (tick Accept, or Accept all per view)'; $chkOnlyTicked.Location = New-Object System.Drawing.Point(16, 282); $chkOnlyTicked.AutoSize = $true; $chkOnlyTicked.Checked = $false; $setup.Controls.Add($chkOnlyTicked)
+$chkRemoveEmpty = New-Object System.Windows.Forms.CheckBox; $chkRemoveEmpty.Text = 'Remove empty folders after Full Run (only inside the Movies / Series folders; Undo recreates them)'; $chkRemoveEmpty.Location = New-Object System.Drawing.Point(16, 254); $chkRemoveEmpty.AutoSize = $true; $chkRemoveEmpty.Checked = $true; $setup.Controls.Add($chkRemoveEmpty)
+foreach ($c in @($setup.Controls)) { if ($c.Top -ge 300) { $c.Top += 28 } }   # room for the .nfo option
+$chkDeleteNfo = New-Object System.Windows.Forms.CheckBox; $chkDeleteNfo.Text = 'Delete .nfo files during Full Run (sent to the Recycle Bin; never on drives without one)'; $chkDeleteNfo.Location = New-Object System.Drawing.Point(16, 310); $chkDeleteNfo.AutoSize = $true; $chkDeleteNfo.Checked = $true; $setup.Controls.Add($chkDeleteNfo)
+$setup.ClientSize = New-Object System.Drawing.Size(560, 642)
+$btnSetupClose = New-Button 'Close' 454 602 90; $setup.AcceptButton = $btnSetupClose; $setup.CancelButton = $btnSetupClose; $btnSetupClose.DialogResult = 'OK'
 $script:UiHost = $form
 $btnScan   = New-Button 'Scan' 12 112 130
 $btnRun    = New-Button 'Full Run' 150 112 100
@@ -135,17 +147,20 @@ $btnUndo   = New-Button 'Undo...' 258 112 90
 $btnExport = New-Button 'Export plan CSV...' 356 112 140
 $btnCancel = New-Button 'Stop' 504 112 80; $btnCancel.Enabled = $false   # halts whatever is running (Scan, Full Run, Undo, subtitles) after the current file
 $btnDups = New-Button 'Duplicates...' 592 112 100; $btnDups.Enabled = $false
+$btnMatch = New-Button 'Choose match...' 828 112 120; $btnMatch.Enabled = $false   # pick the right movie/show for a low-confidence row (also: double-click the row)
+$btnAcceptAll = New-Button 'Accept all' 792 74 95; $btnAcceptAll.Enabled = $false   # ticks Accept on every low-confidence movie/show in the current view
+$btnClearAcc = New-Button 'Clear accepts' 893 74 105; $btnClearAcc.Enabled = $false
 $btnSubs = New-Button 'Get subtitles...' 700 112 120; $btnSubs.Visible = $false   # shown only when subtitle download is enabled in Setup (Update-SubsUi)
 
 $lblShow = New-Label 'Show:' 996 118; $lblShow.Anchor = 'Top,Right'   # right-justified on the button row
 $cmbFilter = New-Object System.Windows.Forms.ComboBox; $cmbFilter.DropDownStyle = 'DropDownList'; $cmbFilter.Location = New-Object System.Drawing.Point(1040, 114); $cmbFilter.Width = 180; $cmbFilter.Anchor = 'Top,Right'
-@('All', 'Will move - high', 'Will move - low', 'Multiple versions', 'Duplicates / collisions', 'Unmatched / left in place', 'Already correctly named') | ForEach-Object { [void]$cmbFilter.Items.Add($_) }
+@('All', 'Low confidence - review', 'Will move - high', 'Will move - low', 'Multiple versions', 'Duplicates / collisions', 'Unmatched / left in place', 'Already correctly named', 'Folder case fixes', 'NFO files to delete') | ForEach-Object { [void]$cmbFilter.Items.Add($_) }
 $cmbFilter.SelectedIndex = 0; $form.Controls.Add($cmbFilter)
 $lblSearch = New-Label 'Search:' 490 80; $txtSearch = New-Text 545 76 235; $txtSearch.Anchor = 'Top,Left'   # sits on the Name source row, right of 'Only high-confidence'
 
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Location = New-Object System.Drawing.Point(12, 150); $grid.Size = New-Object System.Drawing.Size(1208, 430); $grid.Anchor = 'Top,Bottom,Left,Right'
-$grid.ReadOnly = $true; $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.RowHeadersVisible = $false
+$grid.ReadOnly = $false; $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.RowHeadersVisible = $false   # only the Accept column can be edited (set in Fill-Table)
 $grid.SelectionMode = 'FullRowSelect'; $grid.AutoSizeColumnsMode = 'None'
 $form.Controls.Add($grid)
 
@@ -161,15 +176,18 @@ $lblVersion.Font = New-Object System.Drawing.Font('Segoe UI', 7.5); $form.Contro
 
 # ---------- data table ----------
 $table = New-Object System.Data.DataTable
-foreach ($c in 'status', 'confidence', 'media_type', 'old_name', 'new_name', 'note', 'tmdb_id', 'old_path', 'new_path', 'dup_sort', 'dup_flag') { [void]$table.Columns.Add($c) }
+[void]$table.Columns.Add('accept', [bool])
+foreach ($c in 'status', 'confidence', 'media_type', 'old_name', 'new_name', 'note', 'tmdb_id', 'old_path', 'new_path', 'dup_sort', 'dup_flag', 'group_key', 'review', 'case_rep', 'tick') { [void]$table.Columns.Add($c) }
 $grid.DataSource = $table
 $script:Rows = $null; $script:Mode = 'plan'
 
 function Get-Status($r) {
     $n = [string]$r.note
+    if ($n.StartsWith('nfo: delete')) { return 'nfo: delete' }
     if ($n -like '*DUPLICATE*' -or $n -like '*COLLISION*') { return 'duplicate/collision' }
     if ($n -like '*already correctly named*') { return 'already named' }
     if (-not $r.new_path) { return 'unmatched/left' }
+    if (Test-PRCaseOnly $r) { return 'folder case' }
     if ($n -like '*MULTIPLE VERSIONS*') { return 'move: multiple versions' }
     return 'move: ' + $r.confidence
 }
@@ -177,16 +195,19 @@ function Leaf([string]$p) { if (-not $p) { return '' }; return [System.IO.Path]:
 function Fill-Table($rows, [string]$mode) {
     $grid.DataSource = $null; $table.Clear(); $table.BeginLoadData()
     foreach ($r in $rows) {
-        if ($mode -eq 'undo') { [void]$table.Rows.Add('undo', '', '', (Leaf $r.new_path), (Leaf $r.old_path), "moved $($r.moved_at)", '', $r.new_path, $r.old_path) }
-        else { [void]$table.Rows.Add((Get-Status $r), $r.confidence, $r.media_type, (Leaf $r.old_path), (Leaf $r.new_path), $r.note, $r.tmdb_id, $r.old_path, $r.new_path) }
+        if ($mode -eq 'undo') { [void]$table.Rows.Add($false, 'undo', '', '', (Leaf $r.new_path), (Leaf $r.old_path), "moved $($r.moved_at)", '', $r.new_path, $r.old_path, '', '', '', '', '', '') }
+        else { $st = Get-Status $r; [void]$table.Rows.Add(($r.accepted -eq 'yes'), $st, $(if ($st -eq 'already named') { '' } else { $r.confidence }), $r.media_type, (Leaf $r.old_path), (Leaf $r.new_path), $r.note, $r.tmdb_id, $r.old_path, $r.new_path, '', '', [string]$r.group_key, $(if (Test-PRReviewable $r) { '1' } else { '' }), [string]$r.case_rep, $(if (Test-PRTickable $r) { '1' } else { '' })) }
     }
     Update-DupSortKeys
     $table.EndLoadData(); $grid.DataSource = $table
     $table.DefaultView.Sort = 'dup_sort ASC'   # original order, but the copies of a duplicate group stay together (best first)
-    $w = @{ status = 140; confidence = 75; media_type = 70; old_name = 380; new_name = 380; note = 400; tmdb_id = 60; old_path = 100; new_path = 100 }
+    $w = @{ accept = 58; status = 140; confidence = 75; media_type = 70; old_name = 380; new_name = 380; note = 400; tmdb_id = 60; old_path = 100; new_path = 100 }
     foreach ($col in $grid.Columns) { if ($w.ContainsKey($col.Name)) { $col.Width = $w[$col.Name] }; $col.SortMode = 'Automatic' }
     Set-FillColumns $grid @('old_name', 'new_name', 'note')
     $grid.Columns['old_path'].Visible = $false; $grid.Columns['new_path'].Visible = $false; $grid.Columns['dup_sort'].Visible = $false; $grid.Columns['dup_flag'].Visible = $false
+    $grid.Columns['group_key'].Visible = $false; $grid.Columns['review'].Visible = $false; $grid.Columns['case_rep'].Visible = $false; $grid.Columns['tick'].Visible = $false
+    foreach ($col in $grid.Columns) { $col.ReadOnly = ($col.Name -ne 'accept') }
+    $grid.Columns['accept'].HeaderText = 'Accept'; $grid.Columns['accept'].Visible = ($mode -ne 'undo'); $grid.Columns['accept'].ToolTipText = 'Tick a low-confidence movie or show to rename it in the Full Run'
     foreach ($cn in 'status', 'confidence', 'media_type', 'tmdb_id') { $grid.Columns[$cn].AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells }
     Apply-Filter
     $grid.CurrentCell = $null; $grid.ClearSelection()
@@ -194,12 +215,15 @@ function Fill-Table($rows, [string]$mode) {
 function Apply-Filter {
     $f = @()
     switch ($cmbFilter.SelectedItem) {
+        'Low confidence - review'   { $f += "review = '1'" }
         'Will move - high'          { $f += "status = 'move: high'" }
         'Will move - low'           { $f += "status = 'move: low'" }
         'Multiple versions'         { $f += "status = 'move: multiple versions'" }
         'Duplicates / collisions'   { $f += "(status = 'duplicate/collision' OR dup_flag = '1')" }   # includes the green keeper rows of each group
         'Unmatched / left in place' { $f += "status = 'unmatched/left'" }
         'Already correctly named'   { $f += "status = 'already named'" }
+        'Folder case fixes'         { $f += "status = 'folder case' AND case_rep = '1'" }   # one row per folder
+        'NFO files to delete'       { $f += "status = 'nfo: delete'" }
     }
     $q = $txtSearch.Text.Trim()
     if ($q) {
@@ -266,6 +290,132 @@ $grid.Add_CellToolTipTextNeeded({ param($s, $e)
 $cmbFilter.Add_SelectedIndexChanged({ Apply-Filter })
 $txtSearch.Add_TextChanged({ Apply-Filter })
 
+# ---------- Accept / Choose match for low-confidence rows ----------
+# Accept is unticked after every scan; ticking it on one row ticks the whole movie (with its subtitles) or the whole show
+$script:AcceptBusy = $false
+function Find-PlanRow([string]$oldPath) { foreach ($r in $script:Rows) { if ($r.old_path -eq $oldPath) { return $r } }; return $null }
+$grid.Add_CellBeginEdit({ param($s, $e)
+    if ($grid.Columns[$e.ColumnIndex].Name -ne 'accept' -or $script:Mode -ne 'plan') { $e.Cancel = $true; return }
+    $dv = $grid.Rows[$e.RowIndex].DataBoundItem
+    if (-not $dv -or [string]$dv.Row['tick'] -ne '1') { $e.Cancel = $true; if ($dv -and [string]$dv.Row['review'] -eq '1') { Write-UiLog 'No match to accept for this file yet: use Choose match... (or double-click the row) to pick one.' }; return }   # any row with a pending change
+    if (-not [string]$dv.Row['new_path']) { $e.Cancel = $true; Write-UiLog 'No match to accept for this file yet: use Choose match... (or double-click the row) to pick one.' }
+})
+$grid.Add_CurrentCellDirtyStateChanged({ if ($grid.IsCurrentCellDirty -and $grid.CurrentCell -and $grid.Columns[$grid.CurrentCell.ColumnIndex].Name -eq 'accept') { [void]$grid.CommitEdit('CurrentCellChange') } })
+$grid.Add_CellValueChanged({ param($s, $e)
+    if ($script:AcceptBusy -or $e.RowIndex -lt 0 -or $grid.Columns[$e.ColumnIndex].Name -ne 'accept') { return }
+    $dv = $grid.Rows[$e.RowIndex].DataBoundItem; if (-not $dv) { return }
+    $gk = [string]$dv.Row['group_key']; if (-not $gk) { return }
+    $on = [bool]$dv.Row['accept']
+    $script:AcceptBusy = $true
+    try {
+        $n = Set-PRAccepted $script:Rows $gk $on
+        foreach ($tr in $table.Rows) { if ([string]$tr['group_key'] -eq $gk) { $tr['accept'] = $on } }
+        if ($gk.StartsWith('show|') -and $n -gt 1) { Write-UiLog ("{0} all {1} files of this show." -f $(if ($on) { 'Accepted' } else { 'Un-accepted' }), $n) }
+    } finally { $script:AcceptBusy = $false }
+})
+function Show-MatchPicker($row) {
+    $kind = 'movie'; if ([string]$row.group_key -like 'show|*') { $kind = 'show' }
+    $q = ([string]$row.query).Split('|'); $qt = $q[0]; $qy = ''; if ($q.Count -gt 1) { $qy = $q[1] }
+    $t = $Themes[$script:ThemeEff]; if (-not $t) { $t = $Themes['Light'] }; $dark = ($script:ThemeEff -eq 'Dark')
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Choose match - Renamr'; $f.Size = New-Object System.Drawing.Size(900, 520); $f.StartPosition = 'CenterParent'
+    $f.MinimumSize = New-Object System.Drawing.Size(640, 360); $f.Font = $form.Font; if ($form.Icon) { $f.Icon = $form.Icon }
+    $f.MinimizeBox = $false; $f.ShowInTaskbar = $false
+    $hdr = New-Object System.Windows.Forms.Label; $hdr.Location = New-Object System.Drawing.Point(12, 10); $hdr.Size = New-Object System.Drawing.Size(860, 36); $hdr.Anchor = 'Top,Left,Right'
+    $what = 'File'; if ($kind -eq 'show') { $what = 'Show (applies to every episode)' }
+    $hdr.Text = "${what}: $([IO.Path]::GetFileName([string]$row.old_path))"; $f.Controls.Add($hdr)
+    $l1 = New-Object System.Windows.Forms.Label; $l1.Text = 'Title:'; $l1.AutoSize = $true; $l1.Location = New-Object System.Drawing.Point(12, 54); $f.Controls.Add($l1)
+    $tT = New-Object System.Windows.Forms.TextBox; $tT.Location = New-Object System.Drawing.Point(60, 50); $tT.Width = 460; $tT.Text = $qt; $f.Controls.Add($tT)
+    $l2 = New-Object System.Windows.Forms.Label; $l2.Text = 'Year:'; $l2.AutoSize = $true; $l2.Location = New-Object System.Drawing.Point(532, 54); $f.Controls.Add($l2)
+    $tY = New-Object System.Windows.Forms.TextBox; $tY.Location = New-Object System.Drawing.Point(572, 50); $tY.Width = 60; $tY.Text = $qy; $f.Controls.Add($tY)
+    $bS = New-Object System.Windows.Forms.Button; $bS.Text = 'Search'; $bS.Location = New-Object System.Drawing.Point(644, 48); $bS.Size = New-Object System.Drawing.Size(90, 28); $f.Controls.Add($bS)
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.Location = New-Object System.Drawing.Point(12, 86); $g.Size = New-Object System.Drawing.Size(860, 340); $g.Anchor = 'Top,Bottom,Left,Right'
+    $g.ReadOnly = $true; $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false; $g.AllowUserToResizeRows = $false
+    $g.RowHeadersVisible = $false; $g.SelectionMode = 'FullRowSelect'; $g.MultiSelect = $false
+    foreach ($spec in @(@('Title', 260), @('Year', 50), @('Source', 60), @('Id', 70), @('Match', 50), @('Overview', 400))) {
+        $c = New-Object System.Windows.Forms.DataGridViewTextBoxColumn; $c.Name = $spec[0]; $c.HeaderText = $spec[0]; $c.Width = $spec[1]; $c.SortMode = 'NotSortable'; [void]$g.Columns.Add($c)
+    }
+    $g.Columns['Overview'].AutoSizeMode = 'Fill'; $f.Controls.Add($g)
+    $bOk = New-Object System.Windows.Forms.Button; $bOk.Text = 'Accept this match'; $bOk.Size = New-Object System.Drawing.Size(150, 32); $bOk.Location = New-Object System.Drawing.Point(604, 438); $bOk.Anchor = 'Bottom,Right'; $bOk.Enabled = $false
+    $bC = New-Object System.Windows.Forms.Button; $bC.Text = 'Cancel'; $bC.Size = New-Object System.Drawing.Size(110, 32); $bC.Location = New-Object System.Drawing.Point(762, 438); $bC.Anchor = 'Bottom,Right'
+    $bOk.DialogResult = 'OK'; $bC.DialogResult = 'Cancel'; $f.CancelButton = $bC; $f.AcceptButton = $bS
+    $f.Controls.Add($bOk); $f.Controls.Add($bC)
+    $script:PickList = @()
+    $fill = {
+        $g.Rows.Clear(); $bOk.Enabled = $false
+        $yy = $null; $yt = $tY.Text.Trim(); if ($yt -match '^\d{4}$') { $yy = [int]$yt }
+        $f.Cursor = 'WaitCursor'
+        try { $script:PickList = @(Invoke-MainPR { $db = New-UiDb; Get-PRCandidates $db $kind $tT.Text.Trim() $yy }) } catch { Write-UiLog "Search failed: $($_.Exception.Message)"; $script:PickList = @() } finally { $f.Cursor = 'Default' }
+        foreach ($c in $script:PickList) { [void]$g.Rows.Add([object[]]@([string]$c.Title, [string]$c.Year, $(if ($c.Provider -eq 'tvdb') { 'TVDB' } else { 'TMDB' }), [string]$c.Id, ('{0:N2}' -f [double]$c.Sim), [string]$c.Overview)) }
+        if ($script:PickList.Count -eq 0) { $hdr.Text = "${what}: $([IO.Path]::GetFileName([string]$row.old_path))   (nothing found - change the title or year and Search)" }
+        $g.CurrentCell = $null; $g.ClearSelection()
+    }
+    $bS.Add_Click($fill)
+    $g.Add_SelectionChanged({ $bOk.Enabled = ($g.SelectedRows.Count -eq 1) })
+    $g.Add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0) { $f.DialogResult = 'OK'; $f.Close() } })
+    $f.BackColor = $t.Back; $f.ForeColor = $t.Fore; Theme-Controls $f $t $dark @()
+    $f.Add_HandleCreated({ Theme-Window $f $dark })
+    $f.Add_Shown({ & $fill })
+    $res = $f.ShowDialog($form)
+    $pick = $null; if ($res -eq 'OK' -and $g.SelectedRows.Count -eq 1) { $pick = $script:PickList[$g.SelectedRows[0].Index] }
+    $f.Dispose()
+    return $pick
+}
+function New-UiDb { New-PRTmdb -Key $txtKey.Text.Trim() -CachePath $CachePath -TvdbKey $txtTvdb.Text.Trim() -TvdbPin $txtPin.Text.Trim() -Source ([string]$cmbSource.SelectedItem) }
+function Invoke-MainPR([scriptblock]$sb) {
+    # engine calls on the UI thread: route its log lines into the log box
+    $script:PRSync = @{ Log = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'); Cancel = $false; Done = 0; Total = 0; Phase = '' }
+    try { & $sb } finally { $m = $null; while ($script:PRSync.Log.TryDequeue([ref]$m)) { Write-UiLog $m }; $script:PRSync = $null }
+}
+function Start-ChooseMatch {
+    if (-not $script:Rows -or $script:Mode -ne 'plan' -or $timer.Enabled) { return }
+    if ($grid.SelectedRows.Count -ne 1) { [System.Windows.Forms.MessageBox]::Show('Select one low-confidence row first (Show: Low confidence - review lists them).', 'Renamr') | Out-Null; return }
+    $dv = $grid.SelectedRows[0].DataBoundItem; if (-not $dv) { return }
+    if ([string]$dv.Row['review'] -ne '1') { [System.Windows.Forms.MessageBox]::Show('Only low-confidence or unmatched movies and episodes can be changed here.', 'Renamr') | Out-Null; return }
+    $row = Find-PlanRow ([string]$dv.Row['old_path']); if (-not $row) { return }
+    $pick = Show-MatchPicker $row; if (-not $pick) { return }
+    $gk = [string]$row.group_key
+    $form.Cursor = 'WaitCursor'
+    try {
+        $script:Rows = Invoke-MainPR { $db = New-UiDb; Update-PRPlanGroup $script:Rows $gk $pick $db $txtMovies.Text.Trim().TrimEnd('\') $txtSeries.Text.Trim().TrimEnd('\') ([bool]$chkScanProbe.Checked) ([bool]$chkFolderLoose.Checked) }
+        try { [void](Update-DupMarks) } catch { }
+        Fill-Table $script:Rows 'plan'
+        Write-UiLog "Accepted `"$($pick.Title)`" ($($pick.Year)) for $([IO.Path]::GetFileName([string]$row.old_path))$(if ($gk -like 'show|*') { ' and the rest of the show' })."
+    } catch { Write-UiLog "Could not apply the match: $($_.Exception.Message)" } finally { $form.Cursor = 'Default' }
+}
+$btnMatch.Add_Click({ Start-ChooseMatch })
+function Sync-AcceptColumn {
+    $script:AcceptBusy = $true
+    try { $acc = @{}; foreach ($r in $script:Rows) { if ($r.accepted -eq 'yes') { $acc[$r.old_path] = $true } }; foreach ($tr in $table.Rows) { $tr['accept'] = $acc.ContainsKey([string]$tr['old_path']) } }
+    finally { $script:AcceptBusy = $false }
+    $grid.CurrentCell = $null; $grid.ClearSelection()
+}
+function Set-AcceptAll([bool]$On) {
+    # acts only on the rows the current Show: filter and Search box show
+    if (-not $script:Rows -or $script:Mode -ne 'plan' -or $timer.Enabled) { return }
+    $vis = @(foreach ($v in $table.DefaultView) { $v.Row })
+    if ($On) {
+        $keys = @($vis | Where-Object { [string]$_['tick'] -eq '1' } | ForEach-Object { [string]$_['group_key'] } | Select-Object -Unique)
+        $noMatch = @($vis | Where-Object { [string]$_['review'] -eq '1' -and -not [string]$_['new_path'] } | ForEach-Object { [string]$_['group_key'] } | Select-Object -Unique).Count
+        if ($keys.Count -eq 0) { Write-UiLog "Accepted 0 row group(s) in this view; $noMatch skipped (no match - use Choose match...)"; return }
+        $ok = [System.Windows.Forms.MessageBox]::Show("Accept $($keys.Count) movie(s)/show(s)/folder(s) shown in this view?`n`nSubtitles and every episode of a show follow. Rows not shown in this view are not changed.", 'Accept all', 'YesNo', 'Question')
+        if ($ok -ne 'Yes') { return }
+        $res = Set-PRAcceptedBulk $script:Rows $keys $true
+        Sync-AcceptColumn
+        Write-UiLog "Accepted $($res.Accepted) row group(s) in this view; $noMatch skipped (no match - use Choose match...)"
+    } else {
+        $keys = @($vis | Where-Object { [bool]$_['accept'] } | ForEach-Object { [string]$_['group_key'] } | Where-Object { $_ } | Select-Object -Unique)
+        if ($keys.Count -eq 0) { Write-UiLog 'Nothing is accepted in this view.'; return }
+        $res = Set-PRAcceptedBulk $script:Rows $keys $false
+        Sync-AcceptColumn
+        Write-UiLog "Cleared $($res.Accepted) accept(s) in this view."
+    }
+}
+$btnAcceptAll.Add_Click({ Set-AcceptAll $true })
+$btnClearAcc.Add_Click({ Set-AcceptAll $false })
+$grid.Add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0 -and $grid.Columns[$e.ColumnIndex].Name -ne 'accept') { Start-ChooseMatch } })
+
 # ---------- background worker (runspace) ----------
 $Sync = [hashtable]::Synchronized(@{})
 $script:PS = $null; $script:Handle = $null; $script:OnDone = $null
@@ -273,7 +423,7 @@ $worker = {
     param($EngineCode, $Sync, $Kind, $A)
     try {
         . ([scriptblock]::Create($EngineCode))
-        $script:PRSync = $Sync
+        $script:PRSync = $Sync; $script:PR_DELETE_NFO = [bool]$Sync.DeleteNfo   # Setup: Delete .nfo files during Full Run
         switch ($Kind) {
             'scan' {
                 $files = Get-PRFiles @($A.MoviesRoot, $A.SeriesRoot)
@@ -281,9 +431,14 @@ $worker = {
                 $db = New-PRTmdb -Key $A.Key -CachePath $A.CachePath -TvdbKey $A.TvdbKey -TvdbPin $A.TvdbPin -Source $A.Source
                 $rows = New-PRPlan -Paths $files -MoviesRoot $A.MoviesRoot -SeriesRoot $A.SeriesRoot -Db $db -ProbeReal ([bool]$A.ProbeReal) -FolderLoose ([bool]$A.FolderLoose)
                 PR-Log ((Get-PRSummary $rows) + " Online lookups made: $($db.Calls).")
+                PR-Log (Get-PRUnmatchedLine $rows)
+                if ($script:PR_DELETE_NFO) { PR-Log (Get-PRNfoLine $rows) }
+                $ef = @(Get-PREmptyFolders @($A.MoviesRoot, $A.SeriesRoot))
+                PR-Log ("Empty folders right now: {0}{1}" -f $ef.Count, $(if ($A.RemoveEmpty) { ' (removed after the Full Run, together with any the run leaves empty)' } else { ' (kept: Remove empty folders is off in Setup)' }))
+                $k = 0; foreach ($d in $ef) { if ($k -ge 200) { PR-Log "  ...and $($ef.Count - 200) more"; break }; PR-Log "  empty: $d"; $k++ }
                 $Sync.Result = $rows
             }
-            'apply' { $Sync.Result = Invoke-PRApply -Rows $A.Rows -HighOnly:$A.HighOnly -UndoLog $A.UndoLog }
+            'apply' { $script:PR_ONLY_TICKED = [bool]$A.OnlyTicked; $Sync.Result = Invoke-PRApply -Rows $A.Rows -HighOnly:$A.HighOnly -UndoLog $A.UndoLog -Roots $A.Roots -RemoveEmpty:([bool]$A.RemoveEmpty) -DeleteNfo:([bool]$A.DeleteNfo) }
             'undo'  { $Sync.Result = Invoke-PRUndo -UndoLog $A.UndoLog }
             'delete' { $Sync.Result = Remove-PRFiles -Items $A.Items -LogPath $A.LogPath -Folders $A.Folders }
             'subsplan' {
@@ -303,6 +458,7 @@ function Set-Busy([bool]$busy) {
     foreach ($b in $btnScan, $btnRun, $btnUndo, $btnExport, $btnMovies, $btnSeries, $btnSetup, $btnSubs) { $b.Enabled = -not $busy }
     $btnCancel.Enabled = $busy
     $btnDups.Enabled = (-not $busy) -and ($null -ne $script:Rows) -and ($script:Mode -eq 'plan')
+    $btnMatch.Enabled = $btnDups.Enabled; $btnAcceptAll.Enabled = $btnDups.Enabled; $btnClearAcc.Enabled = $btnDups.Enabled
     $form.Cursor = if ($busy) { 'AppStarting' } else { 'Default' }
 }
 function Update-SubsUi {
@@ -314,6 +470,7 @@ function Update-SubsUi {
 function Start-Work([string]$kind, $argsHash, [scriptblock]$onDone) {
     $Sync.Clear()
     $Sync.Log = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+    $Sync.DeleteNfo = [bool]$chkDeleteNfo.Checked   # the worker plans .nfo rows as 'nfo: delete' when on
     $Sync.Done = 0; $Sync.Total = 0; $Sync.Phase = 'Starting'; $Sync.Cancel = $false; $Sync.Finished = $false
     $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'STA'; $rs.Open()
     $script:PS = [powershell]::Create(); $script:PS.Runspace = $rs
@@ -350,7 +507,10 @@ function Pick-Folder($tb) {
     if ($tb.Text -and (Test-Path -LiteralPath $tb.Text)) { $d.SelectedPath = $tb.Text }
     if ($d.ShowDialog($form) -eq 'OK') { $tb.Text = $d.SelectedPath }
 }
-$btnSetup.Add_Click({ [void]$setup.ShowDialog($form); try { Save-Settings } catch { Write-UiLog "Could not save settings: $($_.Exception.Message)" }; Update-SubsUi })
+$btnSetup.Add_Click({ [void]$setup.ShowDialog($form)
+    $script:PR_DELETE_NFO = [bool]$chkDeleteNfo.Checked; $Sync.DeleteNfo = $script:PR_DELETE_NFO
+    if ($script:PR_ONLY_TICKED -ne [bool]$chkOnlyTicked.Checked) { $script:PR_ONLY_TICKED = [bool]$chkOnlyTicked.Checked; if ($script:Rows -and $script:Mode -eq 'plan') { Fill-Table $script:Rows 'plan' } }   # which rows can be ticked depends on it
+    try { Save-Settings } catch { Write-UiLog "Could not save settings: $($_.Exception.Message)" }; Update-SubsUi })
 $btnMovies.Add_Click({ Pick-Folder $txtMovies })
 $btnSeries.Add_Click({ Pick-Folder $txtSeries })
 $chkScanProbe.Add_CheckedChanged({ if ($script:SettingsLoaded) { try { Save-Settings } catch { } } })
@@ -373,13 +533,15 @@ $btnScan.Add_Click({
     }
     try { Save-Settings } catch { Write-UiLog "Could not save settings: $($_.Exception.Message)" }
     Write-UiLog "Scanning (dry run, nothing is changed)..."
-    Start-Work 'scan' @{ MoviesRoot = $m; SeriesRoot = $s; Key = $txtKey.Text.Trim(); CachePath = $CachePath; TvdbKey = $txtTvdb.Text.Trim(); TvdbPin = $txtPin.Text.Trim(); Source = $src; ProbeReal = $chkScanProbe.Checked; FolderLoose = $chkFolderLoose.Checked } {
+    Start-Work 'scan' @{ MoviesRoot = $m; SeriesRoot = $s; Key = $txtKey.Text.Trim(); CachePath = $CachePath; TvdbKey = $txtTvdb.Text.Trim(); TvdbPin = $txtPin.Text.Trim(); Source = $src; ProbeReal = $chkScanProbe.Checked; FolderLoose = $chkFolderLoose.Checked; RemoveEmpty = $chkRemoveEmpty.Checked } {
         param($rows)
         $script:Rows = $rows; $script:Mode = 'plan'
         $ng = 0; $form.Cursor = 'WaitCursor'; try { $ng = Update-DupMarks } catch { $script:DupMark = @{}; $script:DupGroup = @{} } finally { $form.Cursor = 'Default' }
         Fill-Table $rows 'plan'
         if ($ng -gt 0) { Write-UiLog "Duplicates: $ng group(s). Green rows = the copy that would be kept, orange rows = copies that would be deleted. Nothing is deleted unless you use Duplicates... > Delete others." }
-        $btnDups.Enabled = $true
+        $btnDups.Enabled = $true; $btnMatch.Enabled = $true; $btnAcceptAll.Enabled = $true; $btnClearAcc.Enabled = $true
+        $rv = Get-PRReviewCounts $rows
+        if ($rv.Total -gt 0) { Write-UiLog "To review: $($rv.Total) movie(s)/show(s) ($($rv.Low) low-confidence matches, $($rv.NoMatch) with no match) (Show: Low confidence - review). Tick Accept to rename them in the Full Run, or use Choose match... to pick a different match." }
         Write-UiLog 'Dry run complete. Review the grid; nothing has been changed. Use Full Run to apply.'
     }
 })
@@ -391,20 +553,25 @@ $btnExport.Add_Click({
 $btnRun.Add_Click({
     if (-not $script:Rows -or $script:Mode -ne 'plan') { [System.Windows.Forms.MessageBox]::Show('Run Scan first, then review the plan.', 'Renamr') | Out-Null; return }
     $hi = $chkHigh.Checked
-    $n = @($script:Rows | Where-Object { $_.new_path -and (-not $hi -or $_.confidence -eq 'high') }).Count
-    if ($n -eq 0) { [System.Windows.Forms.MessageBox]::Show('Nothing to move.', 'Renamr') | Out-Null; return }
-    $what = 'ALL planned'; if ($hi) { $what = 'high-confidence' }
-    $ok = [System.Windows.Forms.MessageBox]::Show("Move/rename $n $what files now?`n`nIf a file with the new name already exists, that file is skipped. An undo log will be written to the Logs folder.", 'Confirm Full Run', 'YesNo', 'Warning')
+    $rc = Get-PRRunCounts $script:Rows $hi; $n = $rc.Total
+    $roots = @(@($txtMovies.Text.Trim().TrimEnd('\'), $txtSeries.Text.Trim().TrimEnd('\')) | Where-Object { $_ })
+    $nEmpty = 0; if ($chkRemoveEmpty.Checked) { try { $nEmpty = @(Get-PREmptyFolders $roots).Count } catch { } }
+    $nNfo = 0; if ($chkDeleteNfo.Checked) { $nNfo = @($script:Rows | Where-Object { ([string]$_.note).StartsWith('nfo: delete') }).Count }
+    if ($n -eq 0 -and $nEmpty -eq 0 -and $rc.CaseFolders -eq 0 -and $nNfo -eq 0) { [System.Windows.Forms.MessageBox]::Show('Nothing to move.', 'Renamr') | Out-Null; return }
+    $what = "$($rc.High) " + $(if ($hi) { 'high-confidence' } else { 'planned' }) + " file(s) renamed`n$($rc.Accepted) low-confidence file(s) you accepted, renamed`n$($rc.Folder) file(s) only put into their own folder (name kept)`n$($rc.CaseFolders) folder name(s) fixed (letter case)"
+    if ($chkDeleteNfo.Checked) { $what += "`n$nNfo .nfo file(s) sent to the Recycle Bin" }
+    if ($chkRemoveEmpty.Checked) { $what += "`n$nEmpty empty folder(s) removed (plus any the run leaves empty; Undo recreates them)" } else { $what += "`n0 empty folders removed (turned off in Setup)" }
+    $ok = [System.Windows.Forms.MessageBox]::Show("Full Run will do now$(if ($chkOnlyTicked.Checked) { ' (only ticked rows - Setup)' }):`n`n$what`n`nIf a file with the new name already exists, that file is skipped. An undo log will be written to the Logs folder.", 'Confirm Full Run', 'YesNo', 'Warning')
     if ($ok -ne 'Yes') { return }
     if (-not (Test-Path -LiteralPath $LogDir)) { [void](New-Item -ItemType Directory -Path $LogDir) }
     $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
     Export-PRPlan $script:Rows (Join-Path $LogDir "plan_$ts.csv")
     $undo = Join-Path $LogDir "undo_$ts.csv"
     Write-UiLog "Applying... (plan saved as Logs\plan_$ts.csv)"
-    Start-Work 'apply' @{ Rows = $script:Rows; HighOnly = $hi; UndoLog = $undo } {
+    Start-Work 'apply' @{ Rows = $script:Rows; HighOnly = $hi; UndoLog = $undo; Roots = $roots; RemoveEmpty = $chkRemoveEmpty.Checked; OnlyTicked = $chkOnlyTicked.Checked; DeleteNfo = $chkDeleteNfo.Checked } {
         param($r)
         if ($r.Cancelled) { $head = "Full Run STOPPED. Moved $($r.Moved) before stopping (skipped $($r.Skipped), failed $($r.Failed)); the rest were not touched."; $ttl = 'Full Run stopped' } else { $head = "Moved $($r.Moved), skipped $($r.Skipped), failed $($r.Failed)."; $ttl = 'Full Run finished' }
-        $undoNote = ''; if ($r.Moved) { $undoNote = "`n`nUndo log: $($r.Log)" }
+        $undoNote = ''; if ($r.NfoRecycled) { $head += " $($r.NfoRecycled) .nfo file(s) sent to the Recycle Bin." }; if ($r.Moved -or $r.NfoRecycled) { $undoNote = "`n`nUndo log: $($r.Log)" }
         [System.Windows.Forms.MessageBox]::Show("$head$undoNote`n`nRun Scan again to see the new state.", $ttl) | Out-Null
         $doneRows = $script:Rows
         $script:Rows = $null; $table.Clear()
@@ -424,7 +591,7 @@ $btnUndo.Add_Click({
     if ($ok -ne 'Yes') { Write-UiLog 'Undo cancelled.'; return }
     Start-Work 'undo' @{ UndoLog = $d.FileName } {
         param($r)
-        [System.Windows.Forms.MessageBox]::Show("Restored $($r.Restored), skipped $($r.Skipped).", 'Undo finished') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Restored $($r.Restored), skipped $($r.Skipped)." + $(if ($r.Recycled) { "`n`n$($r.Recycled) .nfo file(s) are in the Recycle Bin - restore from there if needed." } else { '' }), 'Undo finished') | Out-Null
         $table.Clear()
     }
 })
@@ -824,7 +991,7 @@ $btnDups.Add_Click({
 # ---------- start ----------
 $st = Load-Settings
 $txtMovies.Text = $st.MoviesRoot; $txtSeries.Text = $st.SeriesRoot; $chkHigh.Checked = $st.HighOnly; $txtKey.Text = $st.Key; $txtTvdb.Text = $st.TvdbKey; $txtPin.Text = $st.TvdbPin; $cmbSource.SelectedItem = $st.Source; $chkProbe.Checked = $st.ProbeAlways; $chkScanProbe.Checked = $st.ProbeScan
-$chkSubStd.Checked = $st.SubsStd; $chkSubSdh.Checked = $st.SubsSdh; $chkSubs.Checked = $st.SubsEnable; $chkAutoSubs.Checked = $st.AutoSubs; $chkFolderLoose.Checked = $st.FolderLoose
+$chkSubStd.Checked = $st.SubsStd; $chkSubSdh.Checked = $st.SubsSdh; $chkSubs.Checked = $st.SubsEnable; $chkAutoSubs.Checked = $st.AutoSubs; $chkFolderLoose.Checked = $st.FolderLoose; $chkRemoveEmpty.Checked = $st.RemoveEmpty; $chkOnlyTicked.Checked = $st.OnlyTicked; $script:PR_ONLY_TICKED = [bool]$st.OnlyTicked; $chkDeleteNfo.Checked = $st.DeleteNfo; $script:PR_DELETE_NFO = [bool]$st.DeleteNfo; $Sync.DeleteNfo = $script:PR_DELETE_NFO
 Update-SubsUi
 $cmbTheme.SelectedItem = $st.Theme
 Apply-Theme $st.Theme

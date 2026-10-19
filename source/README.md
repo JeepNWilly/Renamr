@@ -19,6 +19,9 @@ It is pure Windows PowerShell 5.1 with WinForms, so it runs on stock Windows 10/
 | `tests/Test-Subtitles.ps1` | Offline (mocked HTTP) tests of the subtitle feature: candidate choice (standard vs SDH, commentary and non-English rejected), file naming, skipping existing files, ad-line stripping, the 3-candidate fallback, the 429 stop, id mapping and rename/Duplicates compatibility. |
 | `tests/Test-GuiSubs.ps1` | Windows-only GUI check of the Get subtitles feature on a temp copy of the app: button/checkbox visibility, layout overlap, settings, busy state, themes. With `-Live` it also runs the real background worker (lookup + download of one movie into a temp folder). |
 | `tests/Test-ApplyUndo.ps1` | Creates a temporary fake library, then checks apply, HighOnly, no-overwrite, bracket names, undo and folder cleanup. |
+| `tests/Test-FolderLoose.ps1`, `Test-Accept.ps1`, `Test-Folders.ps1` | Loose-movie folders and folder-only moves; Accept / Accept all / Choose match and the run counts; folder letter case, empty-folder removal and their undo. |
+| `tests/Test-Reattach.ps1` | Orphan sidecar re-attach (tags, Subs folders, Part II = Part 2, other folders), duplicate vs numbered sidecars, the Unmatched line, apply and undo. |
+| `tests/Test-Nfo.ps1` | The Delete .nfo option with a mocked Recycle Bin: on/off, exclusions, no-Recycle-Bin drives, empty-folder clean-up, undo log and Undo report. |
 | `tests/sample_paths.txt` | 40 sample paths for the test above. |
 | `reference/` | The original command-line tools (`plan.py`, `apply.ps1`, `undo.ps1`) that the app was ported from. |
 
@@ -29,7 +32,7 @@ It is pure Windows PowerShell 5.1 with WinForms, so it runs on stock Windows 10/
    `powershell -ExecutionPolicy Bypass -File tests\Test-Engine.ps1 -PathsFile tests\sample_paths.txt -Cache ..\tmdb_cache.json -Out out.csv`
 3. Rebuild: double-click `BUILD.cmd`, or run `powershell -ExecutionPolicy Bypass -File build_exe.ps1`.
    Output goes to the parent folder (`..\Renamr.ps1`, `..\Renamr.exe`).
-4. You can also run the GUI straight from source: `powershell -STA -ExecutionPolicy Bypass -File Renamr.Gui.ps1`. It loads the engine file that sits next to it.
+4. You can also run the GUI straight from source: `powershell -STA -ExecutionPolicy Bypass -File Renamr.Gui.ps1`. It loads the engine file that sits next to it, and uses the `settings.json`, cache and `Logs` of the app folder above `source\`.
 
 ## Where things live
 - **Tags stripped from names:** `$PR_TAGS`. Add release words there.
@@ -39,7 +42,7 @@ It is pure Windows PowerShell 5.1 with WinForms, so it runs on stock Windows 10/
 - **Confidence rules:** `PR-MatchMovie`, `PR-MatchShow`, and the confidence line in `New-PRPlan`.
 
 ## Data files next to the app
-- `settings.json`: folders, the HighOnly option, and the TMDB and TVDB keys (plus optional TVDB PIN) encrypted with DPAPI. Only the same Windows user on the same PC can decrypt the key.
+- `settings.json`: folders, the HighOnly option, the Setup options (`FolderLoose`, `RemoveEmpty`, `OnlyTicked`, `DeleteNfo`, subtitle and theme options), and the TMDB and TVDB keys (plus optional TVDB PIN) encrypted with DPAPI. Only the same Windows user on the same PC can decrypt the key.
 - `tmdb_cache.json`: trimmed TMDB responses stored as `[{"k":..., "v":...}]`, using the same keys as plan.py. Delete it to force fresh lookups.
 - `subs_cache.json`: cached The Subtitle Database lookups (3 days).
 - `Logs\plan_*.csv` and `Logs\undo_*.csv`: one pair per Full Run. `Logs\deleted_*.csv`: Duplicates deletions. `Logs\subtitles_*.csv`: every subtitle download attempt.
@@ -52,6 +55,20 @@ It is pure Windows PowerShell 5.1 with WinForms, so it runs on stock Windows 10/
 
 ## Movie folders
 Setup has a checkbox **Put movies that are not in a folder into their own "Name (Year)" folder** (ticked by default). Unticked, a movie sitting directly in the Movies folder is only renamed in place. Movies already inside a folder are always moved to their `Name (Year)` folder. Code: the `-FolderLoose` parameter of `New-PRPlan`.
+
+## Review, accept and Full Run
+- **Accept** column: tick a low-confidence movie/show to include it. Hidden table columns `group_key`, `review`, `case_rep`, `tick` drive the filters. Engine: `Set-PRAccepted`, `Set-PRAcceptedBulk`, `Test-PRTickable`, `Test-PRReviewable`, `Get-PRReviewCounts`.
+- **Choose match...**: `Get-PRCandidates` lists matches (plus a Title / Year search); `Update-PRPlanGroup` re-plans that group with the pick (`New-PRPlan -Force`).
+- **What a Full Run applies:** `PR-ApplyTarget` - high-confidence rows, ticked rows, and folder-only moves (`fold_path`); with `$PR_ONLY_TICKED` (Setup: Full Run applies only ticked rows) only ticked rows. `Get-PRRunCounts` feeds the confirmation.
+- **Order in `Invoke-PRApply`:** folder letter case (`PR-FixDirCase`) per move, the moves, then .nfo deletion (`-DeleteNfo`, `Remove-PRNfoFiles`), then empty folders (`-RemoveEmpty`, `Remove-PREmptyFolders`).
+- **Undo log `how` column:** `rename`, `accepted`, `folder-only`, `dircase`, `rmdir` (recreated by Undo), `recycle` (.nfo in the Recycle Bin; Undo only reports these).
+- Never touched: Z:, hidden / system / reparse folders, `$PR_KEEP_DIRS` (Recycle Bin, System Volume Information, `#recycle`, `@eaDir`, `#snapshot`).
+
+## Sidecars (subtitles, .nfo)
+- A sidecar follows its video when its name starts with the video's name. Orphans are re-attached in `New-PRPlan`: only video in the folder, title + year among several (`PR-TitleMatch`, `PR-TitleKey`: Part II = Part 2), `Subs\` folders, or a movie in another folder (always low).
+- Tags: `PR-SidecarTags` (kept as written), `PR-CleanSpacedTags` and `PR-SubsLang` (`$PR_NATIVE`, `$PR_REGION`: `fr-CA`, `es-419`, `pt-PT`, `pt-BR`).
+- Clashes: `Test-PRSameSidecar` (same bytes, or size within 3%; a second .nfo always) → DUPLICATE, left in place; otherwise `PR-FreeTarget` numbers it (`.2`, `.3`, or `.und` when untagged) at low confidence.
+- `Get-PRUnmatchedLine` writes the "Unmatched: ..." scan line.
 
 ## Subtitles (Get subtitles...)
 Tick **Enable subtitle download** in Setup to show the **Get subtitles...** button on the main window. Run **Scan** first; the button works on the scanned rows.
