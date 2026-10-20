@@ -1,6 +1,6 @@
-# Renamr
+# Renamr Plus
 
-Renamr is a portable Windows app that renames and organizes your movie and TV files into clean, consistent names, using [TMDB](https://www.themoviedb.org/) and [TheTVDB](https://thetvdb.com/) to identify them. Nothing to install: it is a single `Renamr.exe` (or the same thing as a PowerShell script).
+Renamr Plus (formerly just Renamr) is a portable Windows app that renames and organizes your movie and TV files into clean, consistent names, using [TMDB](https://www.themoviedb.org/) and [TheTVDB](https://thetvdb.com/) to identify them. Nothing to install: it is a single `Renamr.exe` (or the same thing as a PowerShell script).
 
 ```
 Movies:   <Movies>\Title (Year)\Title (Year) - 1080p.ext
@@ -12,12 +12,14 @@ Episodes: <Series>\Show (Year)\Season 01\Show (Year) - S01E01 - Episode Title.ex
 - **Safe by design.** Existing files are never overwritten, every Full Run writes an undo log, and Undo puts files back. File timestamps (created, modified, last accessed) are preserved.
 - **Two data sources.** Movies from TMDB and TV from TVDB by default, each falling back to the other. Confidence ratings let you apply only the high-confidence matches.
 - **Duplicates and multiple versions.** Finds duplicate copies, shades the copy it would keep (green) and the ones it would delete (orange), and lets you choose what to keep. Nothing is deleted unless you choose it.
+- **Smart TV matching.** The show is taken from its folder, years that change from season to season are ignored, and a match must actually have your episodes.
 - **Remake aware.** Uses the year in the file or folder name; never guesses between same-name films by popularity.
 - **Real resolution** in names, read from the file itself.
-- **Review and accept.** A review filter, an Accept tick per movie/show, Accept all per view, and Choose match to pick the right title. Full Run applies high-confidence rows plus what you ticked.
+- **Review and accept.** A review filter, an Accept tick per movie/show, Accept all per view, and Choose match on any row (by title or by TMDB/TVDB ID) to pick the right title; your picks are remembered. The ticks show exactly what Full Run will do.
 - **Tidy folders.** Loose movies get their own folder, folder names that only differ in letter case are fixed, and empty folders are removed (optional; Undo recreates them).
-- **Sidecars follow their video.** Orphan subtitles are re-attached (including `Subs` folders and messy language tags); extra copies are skipped. Optional: send all `.nfo` files to the Recycle Bin.
+- **Sidecars follow their video.** Orphan subtitles are re-attached (including `Subs` folders and messy language tags); extra copies are skipped. Optional: send all `.nfo` files and duplicate subtitles to the Recycle Bin, and standardize season folder names.
 - **English subtitles** (optional): standard and SDH/HI, from The Subtitle Database, with an optional automatic mode after each Full Run.
+- **Fast.** Online lookups run in parallel and are cached; big tables (thousands of rows) fill in about a second.
 - Light, dark or system theme. Stop button halts any run cleanly.
 
 ## Quick start
@@ -31,9 +33,9 @@ More detail: [User guide](docs/USER_GUIDE.md).
 Requires Windows 10/11 with the built-in Windows PowerShell 5.1. From the `source` folder run `BUILD.cmd`. It writes `Renamr.ps1` and `Renamr.exe` one folder up (the exe is compiled with the [ps2exe](https://github.com/MScholtes/PS2EXE) module, which the script installs for the current user if needed). See [Development](docs/DEVELOPMENT.md).
 
 ## License
-Copyright (C) 2026 JeepNWilly. Renamr is free software under the GNU General Public License, version 3 or (at your option) any later version. It comes with no warranty. See [LICENSE](LICENSE).
+Copyright (C) 2026 JeepNWilly. Renamr Plus is free software under the GNU General Public License, version 3 or (at your option) any later version. It comes with no warranty. See [LICENSE](LICENSE).
 
-Renamr uses data from TMDB and TheTVDB and subtitles from The Subtitle Database, which have their own terms. This product uses the TMDB API but is not endorsed or certified by TMDB.
+Renamr Plus uses data from TMDB and TheTVDB and subtitles from The Subtitle Database, which have their own terms. This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 ## Documentation
 - [User guide](docs/USER_GUIDE.md)
@@ -43,4 +45,4 @@ Renamr uses data from TMDB and TheTVDB and subtitles from The Subtitle Database,
 - [Changelog](source/CHANGELOG.md)
 
 ## Status
-Version in [`source/VERSION`](source/VERSION) (the build number is added at compile time). Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-or-later). You may use, study, change and share Renamr, and any version you share must also be open source under the same license.
+Version in [`source/VERSION`](source/VERSION) (the build number is added at compile time). Licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0-or-later). You may use, study, change and share Renamr Plus, and any version you share must also be open source under the same license.

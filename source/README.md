@@ -102,7 +102,7 @@ All colors are in the `$Themes` table in `Renamr.Gui.ps1`.
   - writes that into the generated `Renamr.ps1` as `$AppVersion`;
   - passes it to PS2EXE with `-version`, `-title`, `-product` and `-description`, so it appears in the exe's Properties > Details.
 - `-NoCompile` reuses the current build number without increasing it.
-- The app shows the version in its window title (`Renamr v1.1.0.N`) and in the footer.
+- The app shows the version in its window title (`Renamr Plus v1.1.0.N`; the program is shown as Renamr Plus, while the exe, scripts, folders and settings keep the name Renamr) and in the footer.
 - When the GUI runs straight from source, the version shows as `dev`.
 
 ## Duplicates

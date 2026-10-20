@@ -1,6 +1,21 @@
 # Changelog
 The version in `VERSION` is major.minor.patch. `build_exe.ps1` adds a fourth part, the build number, which is stored in `BUILD_NUMBER` and goes up by one on every exe compile.
 
+## 1.5.0
+- **The program is now called Renamr Plus** (formerly just Renamr). Only the shown name changed: window titles, dialogs, messages, exe details and docs. The file is still `Renamr.exe`, and settings, cache, `Logs`, `match_overrides.json`, the repository and all file names are unchanged.
+- **Folder-first TV matching:** an episode in a show folder takes the show (and the folder's year) from the folder; the file name is the fallback. Years that change per season in file names (`Supernatural (2007) - S03E01`) are treated as season years, not the show year. One search per show folder, so all seasons share one match. The match must contain the folder's episodes: when it lacks most of them, the top 3 results are checked and the one that has them wins ("picked by episodes"). An exact title beats a partial one even with another year. A leftover " - " after SxxEyy no longer gives a "filename title '-' differs" note.
+- **Duplicate subtitles:** new Setup option **Recycle duplicate subtitles during Full Run** (on). Extra copies of a language already placed next to the video go to the Recycle Bin; Show filter **Duplicate subtitles to recycle**.
+- **Season folders:** new Setup option **Standardize season folder names** with a **Season folder format** (default `Season {NN}`, with a preview). `season 1`, `S1`, `Season1` ... are renamed in place; an existing target is never merged. Show filter **Season folder fixes**; Undo renames them back.
+- **US titles:** new Setup option **Use US titles** (on). Searches in US English and names by the main US title; an alternative US/UK title is used only when the file is named exactly that way (e.g. `Redemption (2013)` for *Hummingbird*).
+- **Choose match on every row** (also high confidence), with a search by ID (`136418`, `tmdb:136418`, `tvdb:1884`). Picks are remembered in `match_overrides.json` and used by later Scans, also after the rename; **Clear pick** forgets one.
+- **Ticks show what Full Run will do:** every row Full Run will act on is ticked (renames, folder case and season fixes, .nfo and duplicate subtitle recycling); rows whose Setup option is off are unticked with a note. Unticking a recycle, .nfo or season folder row skips just that item; unticking a movie or show skips it with its subtitles. Accept all / Clear accepts follow the same rules.
+- **Accent tie-break:** when two titles differ only by accents, the one spelled exactly like the file wins.
+- **Faster Scan:** online lookups run in parallel (8 at a time, within TMDB's rate limit, retried on "too many requests") and the cache is saved and reused: about 3x faster on a first scan, seconds on a rescan.
+- **Faster table:** about 4,000 rows fill in 1-2 s instead of ~14 s (no more "Not Responding"); the Show filter, Search and sorting respond instantly; ticking and closing Setup take under a second.
+- **Faster subtitle matching** (same results): ~2019 s → ~38 s on a large library.
+- **Faster Full Run logging:** the undo log is appended instead of rewritten (~476 s → ~8 s on a large run).
+- New tests: `Test-DupSubs`, `Test-Seasons`, `Test-SubsSpeed`, `Test-Accents`, `Test-UsTitles`, `Test-Overrides`, `Test-Ticks`, `Test-RowState`, `Test-SeriesFolders`.
+
 ## 1.4.0
 - **Loose movies get their own folder** even when the file name is already right, or when the rename itself is low confidence: the file is then only moved into its `Name (Year)` folder with its name kept ("folder-only" in the undo log). Its subtitles go with it.
 - **Review and accept:** new **Accept** column and a **Low confidence - review** filter. Tick Accept to include a low-confidence movie or show in the Full Run. **Choose match...** (or double-click a row) opens a picker with the other candidates and a Title / Year search; the pick is applied to the whole movie or show and counts as accepted.

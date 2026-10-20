@@ -48,5 +48,5 @@ if (Test-Path -LiteralPath $icon) {
     $iconArgs['iconFile'] = $icon
     Copy-Item -LiteralPath $icon -Destination (Join-Path $OutDir 'Renamr.ico') -Force   # GUI window icon for the .ps1/.cmd launch
 }
-Invoke-ps2exe @iconArgs -inputFile $ps1 -outputFile $exe -noConsole -STA -title 'Renamr' -product 'Renamr' -version $AppVersion -description "Renamr $AppVersion - renames movie/TV files to Plex naming using TMDB"
+Invoke-ps2exe @iconArgs -inputFile $ps1 -outputFile $exe -noConsole -STA -title 'Renamr Plus' -product 'Renamr Plus' -version $AppVersion -description "Renamr Plus $AppVersion - renames movie/TV files to Plex naming using TMDB"   # display name only; the file stays Renamr.exe
 Write-Host "Built $exe (version $AppVersion)"

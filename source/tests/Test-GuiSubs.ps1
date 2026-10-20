@@ -19,7 +19,7 @@ function Pump([int]$ms) { $sw = [Diagnostics.Stopwatch]::StartNew(); while ($sw.
 function Wait-For([scriptblock]$cond, [int]$sec) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $cond) -and $sw.Elapsed.TotalSeconds -lt $sec) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }; return [bool](& $cond) }
 try {
     $form.StartPosition = 'Manual'; $form.Location = New-Object System.Drawing.Point(40, 40); $form.Show(); Pump 400
-    Chk ($form.Text -like 'Renamr v*') "window title ($($form.Text))"
+    Chk ($form.Text -like 'Renamr Plus v*') "window title ($($form.Text))"
     Chk (-not $chkSubs.Checked) 'subtitle checkbox is off by default'
     Chk (-not $btnSubs.Visible) 'Get subtitles button hidden by default'
     Chk ($chkSubStd.Checked -and $chkSubSdh.Checked) 'standard + SDH options default ON'

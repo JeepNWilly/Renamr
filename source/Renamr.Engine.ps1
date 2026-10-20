@@ -7,6 +7,7 @@
 # No UI code here. The GUI (Renamr.ps1) loads this into a background runspace.
 # Paths are always Windows-style (backslash) strings; path helpers below do not depend on the host OS.
 
+$script:PR_ENGINE_CODE = $null; if ($PSCommandPath -and $PSCommandPath -like '*Renamr.Engine.ps1') { try { $script:PR_ENGINE_CODE = [IO.File]::ReadAllText($PSCommandPath) } catch { } }   # for the parallel lookups (the GUI sets it from its own copy)
 $script:PR_VIDEO   = @('.mkv','.mp4','.avi','.m4v','.mov','.wmv','.mpg','.mpeg','.ts','.m2ts','.webm','.flv','.divx')
 $script:PR_SIDECAR = @('.srt','.sub','.idx','.ass','.ssa','.vtt','.smi','.nfo')
 $script:PR_TAGS = @{}
@@ -85,6 +86,8 @@ function PR-Norm([string]$s) {
     $t = $sb.ToString().ToLowerInvariant().Replace('&', 'and')
     return ([regex]::Replace($t, '[^a-z0-9]+', ' ')).Trim()
 }
+function PR-Spell([string]$s) { if ($null -eq $s) { return '' }; try { $s = $s.Normalize([Text.NormalizationForm]::FormC) } catch { }; return ([regex]::Replace($s.ToLowerInvariant(), '[^\p{L}\p{N}]+', ' ')).Trim() }   # keeps accents: 'Rédemption' <> 'Redemption'
+function PR-SameSpelling([string]$a, [string]$b) { $x = PR-Spell $a; return ($x -and $x -ceq (PR-Spell $b)) }
 function PR-Sim([string]$a, [string]$b) { return [PRDiff]::Ratio((PR-Norm $a), (PR-Norm $b)) }
 function PR-F2([double]$x) { return $x.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) }
 function PR-D2([int]$x) { return $x.ToString('00') }
@@ -182,6 +185,10 @@ function PR-Trim($path, $data) {
         $tv = @(); foreach ($r in @($data.tv_results)) { if ($null -ne $r) { $tv += [pscustomobject]@{ id = $r.id } } }
         return [pscustomobject]@{ movie_results = $mv; tv_results = $tv }
     }
+    if ($path -like '*/alternative_titles') {
+        $res = @(); foreach ($r in @($data.titles) + @($data.results)) { if ($null -ne $r -and $r.iso_3166_1) { $res += [pscustomobject]@{ iso_3166_1 = [string]$r.iso_3166_1; title = [string]$r.title; type = [string]$r.type } } }
+        return [pscustomobject]@{ titles = $res }
+    }
     if ($path -like '/search/*') {
         $res = @(); foreach ($r in @($data.results)) { if ($null -eq $r) { continue }
             $o = [ordered]@{ id = $r.id; popularity = $r.popularity }
@@ -189,10 +196,13 @@ function PR-Trim($path, $data) {
             $res += [pscustomobject]$o }
         return [pscustomobject]@{ results = $res }
     }
+    if ($path -match '^/(movie|tv)/\d+$') { $o = [ordered]@{ id = $data.id }; foreach ($f in 'title','original_title','release_date','name','original_name','first_air_date') { if ($null -ne $data.$f) { $o[$f] = $data.$f } }; return [pscustomobject]$o }   # details (search by id)
     $eps = @(); foreach ($e in @($data.episodes)) { if ($null -ne $e) { $eps += [pscustomobject]@{ episode_number = $e.episode_number; name = $e.name } } }
     return [pscustomobject]@{ episodes = $eps }
 }
-function New-PRTmdb([string]$Key, [string]$CachePath, [string]$TvdbKey = '', [string]$TvdbPin = '', [string]$Source = 'Movies: TMDB, TV: TVDB') {
+$script:PR_US_TITLES = $true   # Setup: Use US titles (TMDB asked in en-US / region US, US release title preferred)
+function New-PRTmdb([string]$Key, [string]$CachePath, [string]$TvdbKey = '', [string]$TvdbPin = '', [string]$Source = 'Movies: TMDB, TV: TVDB', $UsTitles = $null) {
+    if ($null -eq $UsTitles) { $UsTitles = [bool]$script:PR_US_TITLES }
     $cache = New-Object 'System.Collections.Generic.Dictionary[string,object]'
     if ($CachePath -and (Test-Path -LiteralPath $CachePath)) {
         try {
@@ -202,7 +212,7 @@ function New-PRTmdb([string]$Key, [string]$CachePath, [string]$TvdbKey = '', [st
         } catch { PR-Log "Cache unreadable, starting fresh: $($_.Exception.Message)" }
     }
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
-    return @{ Key = $Key; CachePath = $CachePath; Cache = $cache; Last = [Diagnostics.Stopwatch]::StartNew(); Dirty = 0; Calls = 0; Source = $Source; Tvdb = @{ Key = $TvdbKey; Pin = $TvdbPin; Token = ''; Stamp = [Diagnostics.Stopwatch]::StartNew() } }
+    return @{ Key = $Key; CachePath = $CachePath; Cache = $cache; Last = [Diagnostics.Stopwatch]::StartNew(); Dirty = 0; Calls = 0; Source = $Source; UsTitles = [bool]$UsTitles; GapMs = 30; TmdbBase = 'https://api.themoviedb.org/3'; Collect = $null; Tvdb = @{ Key = $TvdbKey; Pin = $TvdbPin; Token = ''; Stamp = [Diagnostics.Stopwatch]::StartNew() } }
 }
 function Save-PRTmdbCache($db) {
     if (-not $db.CachePath) { return }
@@ -219,12 +229,13 @@ function PR-TmdbGet($db, [string]$path, $params) {
     foreach ($k in $params.Keys) { $v = $params[$k]; if ($null -ne $v -and [string]$v -ne '') { $clean[$k] = $v } }
     $ck = $path + '?' + (PR-UrlEncode $clean)
     if ($db.Cache.ContainsKey($ck)) { return $db.Cache[$ck] }
+    if ($null -ne $db.Collect) { $db.Collect[$ck] = @{ Provider = 'tmdb'; Path = $path; Params = $clean }; throw 'PRCollect' }   # prefetch discovery: note the request, stop this lookup
     if (-not $db.Key) { throw "TMDB key missing and $ck not in cache" }
     $q = @{}; foreach ($k in $clean.Keys) { $q[$k] = $clean[$k] }; $q['api_key'] = $db.Key
-    $url = 'https://api.themoviedb.org/3' + $path + '?' + (PR-UrlEncode $q)
+    $url = $db.TmdbBase + $path + '?' + (PR-UrlEncode $q)
     $data = $null; $ok = $false
     for ($attempt = 0; $attempt -lt 6; $attempt++) {
-        $wait = 30 - $db.Last.ElapsedMilliseconds; if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }   # ~30 req/s
+        $wait = $db.GapMs - $db.Last.ElapsedMilliseconds; if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }   # ~30 req/s (each parallel worker gets a share)
         $db.Last.Restart(); $db.Calls++
         try {
             $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
@@ -337,6 +348,7 @@ function PR-TvdbGet($db, [string]$path, $params) {
     $clean = @{}; foreach ($k in $params.Keys) { $v = $params[$k]; if ($null -ne $v -and [string]$v -ne '') { $clean[$k] = $v } }
     $ck = 'tvdb|' + $path + '?' + (PR-UrlEncode $clean)
     if ($db.Cache.ContainsKey($ck)) { return $db.Cache[$ck] }
+    if ($null -ne $db.Collect) { $db.Collect[$ck] = @{ Provider = 'tvdb'; Path = $path; Params = $clean }; throw 'PRCollect' }
     if (-not $db.Tvdb.Key) { throw "TVDB key missing and $ck not in cache" }
     $data = $null
     if ($path -eq '/search/movie') { $data = PR-TvdbSearch $db 'movie' ([string]$clean['query']) $clean['primary_release_year'] }
@@ -349,7 +361,27 @@ function PR-TvdbGet($db, [string]$path, $params) {
 }
 function PR-Api($db, [string]$provider, [string]$path, $params) {
     if ($provider -eq 'tvdb') { return (PR-TvdbGet $db $path $params) }
+    if ($db.UsTitles) {   # US English names; the language / region are part of the cache key, so US and non-US results never mix
+        $q = @{}; if ($params) { foreach ($k in $params.Keys) { $q[$k] = $params[$k] } }
+        $q['language'] = 'en-US'; if ($path -eq '/search/movie') { $q['region'] = 'US' }
+        $params = $q
+    }
     return (PR-TmdbGet $db $path $params)
+}
+function PR-AltTitles($db, [string]$provider, [string]$kind, $id) {
+    # TMDB's US and GB English alternative titles of a film / show (one cached call); empty when off or not TMDB
+    if (-not $db.UsTitles -or $provider -ne 'tmdb' -or -not $id) { return @() }
+    $j = $null; try { $j = PR-TmdbGet $db "/$kind/$id/alternative_titles" @{} } catch { if ($_.Exception.Message -eq 'PRCollect') { throw }; return @() }
+    if (-not $j) { return @() }
+    return @(@($j.titles) | Where-Object { $_ -and ($_.iso_3166_1 -eq 'US' -or $_.iso_3166_1 -eq 'GB') -and $_.title } | ForEach-Object { [string]$_.title })
+}
+function PR-NameTitle($db, [string]$provider, [string]$kind, $id, [string]$Main, [string]$FileTitle) {
+    # the name to use: always TMDB's main (en-US) title, except when the file's own title is exactly one of the film's US / GB
+    # alternative titles and not the main title ('Redemption' for 136418 'Hummingbird'): then that title is kept. Never substitutes on its own.
+    if (-not $FileTitle) { return $Main }
+    $fs = PR-Spell $FileTitle; if (-not $fs -or $fs -ceq (PR-Spell $Main)) { return $Main }
+    foreach ($a in (PR-AltTitles $db $provider $kind $id)) { if ((PR-Spell $a) -ceq $fs) { return $a } }
+    return $Main
 }
 function PR-Providers($db, [string]$kind = 'movie') {
     # provider order from the Source setting; TVDB only when a key is set (cached TVDB data alone is not used)
@@ -361,11 +393,12 @@ function PR-Providers($db, [string]$kind = 'movie') {
 function PR-Year($s) { if ($s -and ([string]$s).Length -ge 4) { return [int]([string]$s).Substring(0, 4) }; return $null }
 
 function PR-MatchMovieOne($db, [string]$provider, [string]$title, $year) {
-    $best = $null; $sameName = @{}
+    $best = $null; $sameName = @{}; $topC = New-Object System.Collections.Generic.List[object]
     $ys = @($null); if ($year) { $ys = @($year, $null) }
     foreach ($y in $ys) {
         $resp = PR-Api $db $provider '/search/movie' @{ query = $title; primary_release_year = $y; include_adult = 'false' }
         $res = @(); if ($resp) { $res = @($resp.results) }
+        foreach ($r in ($res | Select-Object -First 3)) { if ($r -and $topC.Count -lt 3 -and -not @($topC | Where-Object { [string]$_.id -eq [string]$r.id }).Count) { $topC.Add($r) } }
         foreach ($r in ($res | Select-Object -First 8)) {
             $ry = PR-Year $r.release_date
             $s = [math]::Max((PR-Sim $title ([string]$r.title)), (PR-Sim $title ([string]$r.original_title)))
@@ -377,9 +410,21 @@ function PR-MatchMovieOne($db, [string]$provider, [string]$title, $year) {
             if (-not $yok) { $score -= 0.4 }
             $pop = 0.0; if ($null -ne $r.popularity) { $pop = [double]$r.popularity }
             $score += [math]::Min($pop, 50) / 1000
+            if ($s -ge 0.999 -and ((PR-SameSpelling $title ([string]$r.title)) -or (PR-SameSpelling $title ([string]$r.original_title)))) { $score += 0.06 }   # same name with the same accents wins over an accent-only twin (else 'Rédemption' and 'Redemption' swap on every scan)
             if ($ry -and ($null -eq $best -or $score -gt $best.Score)) { $best = @{ Score = $score; R = $r; S = $s; Ry = $ry; Yok = $yok } }
         }
         if ($best -and $best.S -ge 0.85 -and $best.Yok) { break }
+    }
+    if ($db.UsTitles -and $provider -eq 'tmdb' -and ($null -eq $best -or $best.S -lt 0.85)) {
+        # the file's title missed: try the US release titles of the top 3 candidates (at most 3 extra cached calls)
+        foreach ($r in $topC) {
+            $ry = PR-Year $r.release_date; if (-not $ry) { continue }
+            $s = 0.0; foreach ($ut in (PR-AltTitles $db $provider 'movie' $r.id)) { $x = PR-Sim $title $ut; if ($x -gt $s) { $s = $x } }   # matching only: the name still follows PR-NameTitle
+            if ($s -lt 0.85 -or ($best -and $s -le $best.S)) { continue }
+            $yok = ($null -eq $year) -or ([math]::Abs($ry - $year) -le 1)
+            $score = $s; if ($year -and $ry -eq $year) { $score += 0.15 }; if (-not $yok) { $score -= 0.4 }
+            $best = @{ Score = $score; R = $r; S = $s; Ry = $ry; Yok = $yok }
+        }
     }
     if ($year -and ($null -eq $best -or $best.S -lt 0.6)) {
         $resp = PR-Api $db $provider '/search/movie' @{ query = $title; primary_release_year = $year }
@@ -406,7 +451,9 @@ function PR-MatchMovieOne($db, [string]$provider, [string]$title, $year) {
         $note += "; AMBIGUOUS: films with this name: $($yl -join ', ') - add the year to the file name"
     }
     if ($provider -eq 'tvdb') { $note = 'TVDB: ' + $note }
-    return @{ Provider = $provider; Id = $r.id; Title = (PR-Safe $r.title); Year = $ry; Conf = $conf; Note = $note; Ambig = $ambig }
+    $ttl = PR-NameTitle $db $provider 'movie' $r.id ([string]$r.title) $title
+    if ($ttl -cne [string]$r.title) { $note += "; named by the file's own alternative title `"$ttl`"" }
+    return @{ Provider = $provider; Id = $r.id; Title = (PR-Safe $ttl); Year = $ry; Conf = $conf; Note = $note; Ambig = $ambig }
 }
 function PR-MatchShowOne($db, [string]$provider, [string]$name, $year) {
     $best = $null
@@ -421,19 +468,22 @@ function PR-MatchShowOne($db, [string]$provider, [string]$name, $year) {
             if ($year -and $ry -eq $year) { $score += 0.15 }
             $pop = 0.0; if ($null -ne $r.popularity) { $pop = [double]$r.popularity }
             $score += [math]::Min($pop, 50) / 500
+            if ($s -ge 0.999 -and ((PR-SameSpelling $name ([string]$r.name)) -or (PR-SameSpelling $name ([string]$r.original_name)))) { $score += 0.11 }   # same spelling with accents wins over an accent-only twin
+            if ($s -ge 0.999) { $score += 0.2 }   # the exact title beats a partial one ('Supernatural' over 'Neuro - Supernatural Detective'), even with another year
             if ($ry -and ($null -eq $best -or $score -gt $best.Score)) { $best = @{ Score = $score; R = $r; S = $s; Ry = $ry } }
         }
-        if ($best) { break }
+        if ($best -and ($best.S -ge 0.999 -or $null -eq $y)) { break }   # only a partial match for that year: also look without the year
     }
     if ($null -eq $best -or $best.S -lt 0.6) { return $null }
-    return @{ Provider = $provider; Id = $best.R.id; Name = (PR-Safe $best.R.name); Year = $best.Ry; Sim = $best.S }
+    $nm = [string]$best.R.name; $nm = PR-NameTitle $db $provider 'tv' $best.R.id $nm $name   # main title, or the file's own alternative title
+    return @{ Provider = $provider; Id = $best.R.id; Name = (PR-Safe $nm); Year = $best.Ry; Sim = $best.S }
 }
 function PR-MatchMovie($db, [string]$title, $year) {
     # try providers in order; first high-confidence match wins, else the best low-confidence one
     $keep = $null
     foreach ($pv in (PR-Providers $db)) {
         $m = $null
-        try { $m = PR-MatchMovieOne $db $pv $title $year } catch { if ($keep -or $pv -eq 'tvdb') { PR-Log "[$pv] lookup failed for `"$title`": $($_.Exception.Message)"; continue } else { throw } }
+        try { $m = PR-MatchMovieOne $db $pv $title $year } catch { if ($_.Exception.Message -eq 'PRCollect') { throw }; if ($keep -or $pv -eq 'tvdb') { PR-Log "[$pv] lookup failed for `"$title`": $($_.Exception.Message)"; continue } else { throw } }
         if ($m -and $m.Conf -eq 'high') { return $m }
         if ($m -and -not $keep) { $keep = $m }
     }
@@ -445,7 +495,7 @@ function PR-MatchShow($db, [string]$name, $year) {
     $keep = $null; $keepOk = $false
     foreach ($pv in (PR-Providers $db 'tv')) {
         $m = $null
-        try { $m = PR-MatchShowOne $db $pv $name $year } catch { if ($pv -eq 'tvdb') { PR-Log "[tvdb] lookup failed for `"$name`": $($_.Exception.Message)"; continue } else { throw } }
+        try { $m = PR-MatchShowOne $db $pv $name $year } catch { if ($_.Exception.Message -eq 'PRCollect') { throw }; if ($pv -eq 'tvdb') { PR-Log "[tvdb] lookup failed for `"$name`": $($_.Exception.Message)"; continue } else { throw } }
         if (-not $m) { continue }
         $yok = $true; if ($year -and $m.Year) { $yok = ([math]::Abs([int]$m.Year - [int]$year) -le 1) }
         if ($m.Sim -ge 0.85 -and $yok) { return $m }
@@ -468,6 +518,128 @@ function PR-Left8([string]$x) { if ($x.Length -gt 8) { return $x.Substring(0, 8)
 function PR-NewRow($p) { return [pscustomobject][ordered]@{ old_path = $p; new_path = ''; media_type = ''; tmdb_id = ''; confidence = ''; note = ''; fold_path = ''; accepted = ''; group_key = ''; query = ''; case_rep = '' } }
 
 # ---------- planner: port of plan.py main() ----------
+# ---------- remembered picks (Choose match...), stored in match_overrides.json ----------
+# keys: 'movie|f|<file name without extension>' and 'movie|d|<folder name>' (accents kept, case and punctuation ignored), 'show|<show key>';
+# saved for the name before and after the rename, so a pick still applies once Renamr has renamed the file
+$script:PR_OVR = @{}
+function PR-OvrMovieKeys([string]$Path, [string]$MoviesRoot, [bool]$WithDir = $true) {
+    $k = New-Object System.Collections.Generic.List[string]
+    $st = PR-Spell (PR-SplitExt (PR-Base $Path))[0]; if ($st) { $k.Add('movie|f|' + $st) }
+    $d = PR-Dir $Path
+    if ($WithDir -and $d -and $d.TrimEnd('\').ToLowerInvariant() -ne ([string]$MoviesRoot).TrimEnd('\').ToLowerInvariant()) { $dn = PR-Spell (PR-Base $d); if ($dn) { $k.Add('movie|d|' + $dn) } }
+    return ,$k.ToArray()
+}
+function PR-OvrShowKey([string]$Path) {
+    # the show key a later Scan derives from an episode file name ('Show (2015) - S01E01 - x.mkv' -> show|show|2015)
+    $stem = (PR-SplitExt (PR-Base $Path))[0]; $m = $script:PR_EP.Match($stem); if (-not $m.Success) { return $null }
+    $c = PR-ParseShow $stem.Substring(0, $m.Index); if (-not $c.Title) { return $null }
+    return 'show|' + (PR-Norm $c.Title) + '|' + $c.Year
+}
+function Find-PROverride([string[]]$Keys) { foreach ($k in $Keys) { if ($k -and $script:PR_OVR.ContainsKey($k)) { return $script:PR_OVR[$k] } }; return $null }
+function Import-PROverrides([string]$Path) {
+    $script:PR_OVR = @{}
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return 0 }
+    try { $arr = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json; foreach ($e in @($arr | ForEach-Object { $_ })) {   # PS 5.1 hands a JSON array over as one object: unroll it
+         if ($e -and $e.k -and $e.id) { $script:PR_OVR[[string]$e.k] = [pscustomobject]@{ Provider = [string]$e.provider; Id = $e.id; Title = [string]$e.title; Year = $e.year; Kind = [string]$e.kind } } } }
+    catch { PR-Log "Match overrides unreadable, ignored: $($_.Exception.Message)" }
+    return $script:PR_OVR.Count
+}
+function Export-PROverrides([string]$Path) {
+    if (-not $Path) { return }
+    $list = foreach ($kv in $script:PR_OVR.GetEnumerator()) { [pscustomobject][ordered]@{ k = $kv.Key; kind = $kv.Value.Kind; provider = $kv.Value.Provider; id = $kv.Value.Id; title = $kv.Value.Title; year = $kv.Value.Year } }
+    $tmp = $Path + '.tmp'; [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject @($list) -Depth 4), (New-Object Text.UTF8Encoding($false)))
+    if (Test-Path -LiteralPath $Path) { [IO.File]::Delete($Path) }; [IO.File]::Move($tmp, $Path)
+}
+function Get-PRRowOvrKeys($Row, [string]$MoviesRoot) {
+    # every key that identifies this movie / show, before and after its rename
+    $k = New-Object System.Collections.Generic.List[string]
+    if ([string]$Row.group_key -like 'show|*') { $k.Add([string]$Row.group_key); foreach ($p in $Row.old_path, $Row.new_path) { if ($p) { $sk = PR-OvrShowKey $p; if ($sk) { $k.Add($sk) } } } }
+    else { foreach ($x in (PR-OvrMovieKeys $Row.old_path $MoviesRoot $false)) { $k.Add($x) }; foreach ($p in $Row.new_path, $Row.fold_path) { if ($p) { foreach ($x in (PR-OvrMovieKeys $p $MoviesRoot $true)) { $k.Add($x) } } } }
+    return @($k | Select-Object -Unique)
+}
+function Set-PROverride($Rows, [string]$GroupKey, $Choice, [string]$MoviesRoot) {
+    # remembers $Choice for every video row of the group (call with the re-planned rows, so the new names are known)
+    $kind = 'movie'; if ($GroupKey -like 'show|*') { $kind = 'show' }
+    $v = [pscustomobject]@{ Provider = [string]$Choice.Provider; Id = $Choice.Id; Title = [string]$Choice.Title; Year = $Choice.Year; Kind = $kind }
+    $n = 0; foreach ($r in @($Rows | Where-Object { $_.group_key -eq $GroupKey -and $_.media_type -ne 'sidecar' })) { foreach ($k in (Get-PRRowOvrKeys $r $MoviesRoot)) { $script:PR_OVR[$k] = $v; $n++ } }
+    return $n
+}
+function Remove-PROverride($Rows, [string]$GroupKey, [string]$MoviesRoot) {
+    # forgets the pick(s) of this group: its own keys, and every other key pointing at the same picked film / show
+    $ids = @{}; $keys = @()
+    foreach ($r in @($Rows | Where-Object { $_.group_key -eq $GroupKey -and $_.media_type -ne 'sidecar' })) { $keys += @(Get-PRRowOvrKeys $r $MoviesRoot) }
+    foreach ($k in $keys) { if ($script:PR_OVR.ContainsKey($k)) { $o = $script:PR_OVR[$k]; $ids["$($o.Kind)|$($o.Provider)|$($o.Id)"] = 1 } }
+    $n = 0; foreach ($k in @($script:PR_OVR.Keys)) { $o = $script:PR_OVR[$k]; if ($keys -contains $k -or $ids.ContainsKey("$($o.Kind)|$($o.Provider)|$($o.Id)")) { $script:PR_OVR.Remove($k); $n++ } }
+    return $n
+}
+function Test-PRHasOverride($Rows, [string]$GroupKey, [string]$MoviesRoot) {
+    foreach ($r in @($Rows | Where-Object { $_.group_key -eq $GroupKey -and $_.media_type -ne 'sidecar' })) { if (Find-PROverride (Get-PRRowOvrKeys $r $MoviesRoot)) { return $true } }; return $false
+}
+# ---------- show identity from the show folder (Series\<show>\[Season NN\]episode) ----------
+function PR-IsSeasonDirName([string]$n) { return ($n -match '^(?i)(season|series|staffel|saison)[ ._-]*\d{1,3}$' -or $n -match '^(?i)s\d{1,2}$' -or $n -match '^(?i)specials?$') }
+function PR-ShowNamesAgree([string]$a, [string]$b) {
+    $na = PR-Norm $a; $nb = PR-Norm $b; if (-not $na -or -not $nb) { return $false }
+    return ($na -eq $nb -or $na.Contains($nb) -or $nb.Contains($na) -or (PR-Sim $a $b) -ge 0.6)
+}
+function PR-EpPair($m) {
+    # (season, episode) of a PR_EP match, as two numbers
+    if ($m.Groups[1].Success) { return @([int]$m.Groups[1].Value, [int]$m.Groups[2].Value) }
+    return @([int]$m.Groups[4].Value, [int]$m.Groups[5].Value)
+}
+function Get-PRShowIdentity([string[]]$Videos, [string]$SeriesRoot) {
+    # episode path (lower case) -> @{ Title; Year; Eps; FileYear } for episodes inside a show folder of the Series folder.
+    # The show folder names the show; the file name is only the fallback (a stray file, or a folder that is clearly something else).
+    # A year in the file name is the show's year only when every episode of the folder has that same year; years that change
+    # from season to season ('Supernatural (2007) - S03E01', '(2011) - S07E01') are season years and are not used for matching.
+    $out = @{}; $sroot = ([string]$SeriesRoot).TrimEnd('\'); if (-not $sroot) { return $out }
+    $dirs = @{}; $files = New-Object System.Collections.Generic.List[object]
+    foreach ($p in $Videos) {
+        if (-not (PR-Under $p $sroot)) { continue }
+        $rel = $p.Substring($sroot.Length + 1).Split('\'); if ($rel.Count -lt 2 -or (PR-IsSeasonDirName $rel[0])) { continue }
+        $stem = (PR-SplitExt (PR-Base $p))[0]; $m = $script:PR_EP.Match($stem); if (-not $m.Success) { continue }
+        $fc = PR-ParseShow $stem.Substring(0, $m.Index)
+        $fd = PR-ParseShow $rel[0]; if (-not $fd.Title) { continue }
+        if ($fc.Title -and -not (PR-ShowNamesAgree $fd.Title $fc.Title)) { continue }   # the folder is about something else: keep the file's own name
+        $dk = $rel[0].ToLowerInvariant()
+        if (-not $dirs.ContainsKey($dk)) { $dirs[$dk] = @{ F = $fd; Years = @{}; Eps = (New-Object System.Collections.Generic.List[object]); Seen = @{} } }
+        $d = $dirs[$dk]; $d.Years[[string]$fc.Year] = 1
+        $se = PR-EpPair $m; if ($se[0] -gt 0 -and -not $d.Seen.ContainsKey("$($se[0])|$($se[1])")) { $d.Seen["$($se[0])|$($se[1])"] = 1; $d.Eps.Add($se) }
+        $files.Add(@($p, $dk, $fc.Year))
+    }
+    foreach ($f in $files) {
+        $d = $dirs[$f[1]]; $y = $d.F.Year
+        if (-not $y -and $f[2] -and $d.Years.Count -eq 1) { $y = $f[2] }   # one year on every episode (and none on the folder): the show's year
+        $out[$f[0].ToLowerInvariant()] = @{ Title = $d.F.Title; Year = $y; Eps = $d.Eps; FileYear = $f[2] }
+    }
+    return $out
+}
+function PR-EpShare($db, $seasons, $sh, $Eps) {
+    # share of the folder's episodes (SxxEyy) that the show has (season lists are cached)
+    if (-not $sh -or -not $Eps -or $Eps.Count -eq 0) { return 0.0 }
+    $prov = [string]$sh.Provider; if (-not $prov) { $prov = 'tmdb' }
+    $f = 0; foreach ($se in $Eps) { $eps = PR-Season $db $seasons $sh.Id ([int]$se[0]) $prov; if ($eps.Map.ContainsKey([int]$se[1])) { $f++ } }
+    return ($f / $Eps.Count)
+}
+function PR-MatchShowChecked($db, $seasons, [string]$name, $year, $Eps) {
+    # PR-MatchShow, then a check that the show has the folder's episodes; when it has few of them and one of the top 3
+    # search results has clearly more, that one is used
+    $m = PR-MatchShow $db $name $year
+    if (-not $Eps -or $Eps.Count -eq 0) { return $m }
+    $sm = 0.0; if ($m) { $sm = PR-EpShare $db $seasons $m $Eps }
+    if ($m -and $sm -ge 0.8) { return $m }
+    $best = $null; $bs = $sm
+    foreach ($c in @(Get-PRCandidates $db 'show' $name $year | Select-Object -First 3)) {
+        if (-not $c -or -not $c.Year -or ($m -and [string]$c.Provider -eq [string]$m.Provider -and [string]$c.Id -eq [string]$m.Id)) { continue }
+        $cs = PR-EpShare $db $seasons @{ Provider = $c.Provider; Id = $c.Id } $Eps
+        if ($cs -gt $bs) { $bs = $cs; $best = $c }
+    }
+    if ($best -and $bs -ge 0.5 -and $bs -ge $sm + 0.2) {
+        $nm = PR-NameTitle $db ([string]$best.Provider) 'tv' $best.Id ([string]$best.Title) $name
+        $was = $(if ($m) { "; instead of `"$($m.Name)`" ($($m.Year)), which has $([math]::Round($sm * 100))%" } else { '' })
+        return @{ Provider = [string]$best.Provider; Id = $best.Id; Name = (PR-Safe $nm); Year = $best.Year; Sim = [double]$best.Sim; Check = "picked by episodes: has $([math]::Round($bs * 100))% of this folder's episodes$was" }
+    }
+    return $m
+}
 function New-PRPlan {
     param([string[]]$Paths, [string]$MoviesRoot, [string]$SeriesRoot, $Db, [bool]$ProbeReal = $true, [bool]$FolderLoose = $true, $Force = @{}, [string[]]$OtherPaths = @())
     if ($null -eq $Force) { $Force = @{} }   # Force: group_key -> match the user chose (Choose match...); OtherPaths: other library files, for clash checks
@@ -480,7 +652,8 @@ function New-PRPlan {
     foreach ($p in $ok) { $e = (PR-SplitExt $p)[1].ToLowerInvariant(); if ($script:PR_VIDEO -contains $e) { $videos.Add($p) } elseif ($script:PR_SIDECAR -contains $e) { $sidecars.Add($p) } }
     PR-Log ("Checked {0} files: {1} videos, {2} subtitle and extra files{3}{4}." -f $paths.Count, $videos.Count, $sidecars.Count, $(if ($excluded) { ", $excluded skipped" } else { "" }), $(if (($ok.Count - $videos.Count - $sidecars.Count) -gt 0) { ", $($ok.Count - $videos.Count - $sidecars.Count) other files left alone" } else { "" }))
     $rows = New-Object System.Collections.Generic.List[object]
-    $shows = @{}; $seasons = @{}; $ambig = @{}
+    $shows = @{}; $seasons = @{}; $ambig = @{}; $ovHit = @{}
+    $ident = Get-PRShowIdentity $videos $sroot
     $n = 0
     foreach ($p in $videos) {
         $n++; if ($n % 10 -eq 0) { PR-Progress $n $videos.Count 'Matching videos' }
@@ -514,21 +687,35 @@ function New-PRPlan {
                 $rel = $p.Substring($root.Length + 1).Split('\')
                 $cand = PR-ParseShow $stem.Substring(0, $mstart)
                 if (-not $cand.Title -and $rel.Count -gt 1) { $cand = PR-ParseShow $rel[0] }
+                $fileCand = $cand; $idn = $null; $epsAll = $null
+                if ($m.Success -and $ident.ContainsKey($p.ToLowerInvariant())) {   # show named by its folder; every episode of the folder shares one match
+                    $idn = $ident[$p.ToLowerInvariant()]; $cand = @{ Title = $idn.Title; Year = $idn.Year }; $epsAll = $idn.Eps
+                    if ($idn.FileYear -and $idn.FileYear -ne $idn.Year) { $extraNote = "year $($idn.FileYear) in the file name is the season's year (show taken from its folder)" } else { $extraNote = $null }
+                } else { $extraNote = $null }
                 $key2 = (PR-Norm $cand.Title) + '|' + $cand.Year
                 $row.group_key = 'show|' + $key2; $row.query = "$($cand.Title)|$($cand.Year)"
-                if ($Force.ContainsKey($row.group_key) -and -not $shows.ContainsKey($key2)) { $fc = $Force[$row.group_key]; $shows[$key2] = @{ Provider = [string]$fc.Provider; Id = $fc.Id; Name = (PR-Safe ([string]$fc.Title)); Year = $fc.Year; Sim = 1.0 } }
+                if ($Force.ContainsKey($row.group_key) -and -not $shows.ContainsKey($key2)) { $fc = $Force[$row.group_key]; $fcn = PR-NameTitle $Db ([string]$fc.Provider) 'tv' $fc.Id ([string]$fc.Title) $cand.Title; $shows[$key2] = @{ Provider = [string]$fc.Provider; Id = $fc.Id; Name = (PR-Safe $fcn); Year = $fc.Year; Sim = 1.0 } }
+                if (-not $shows.ContainsKey($key2) -and -not $Force.ContainsKey($row.group_key)) {
+                    $ov = Find-PROverride @($row.group_key, (PR-OvrShowKey $p))
+                    if ($ov) { $ovn = PR-NameTitle $Db ([string]$ov.Provider) 'tv' $ov.Id ([string]$ov.Title) $cand.Title; $shows[$key2] = @{ Provider = [string]$ov.Provider; Id = $ov.Id; Name = (PR-Safe $ovn); Year = $ov.Year; Sim = 1.0; Pick = $true } }
+                }
                 if (-not $shows.ContainsKey($key2)) {
-                    $shows[$key2] = PR-MatchShow $Db $cand.Title $cand.Year
-                    if (-not $shows[$key2] -and $rel.Count -gt 1) { $f = PR-ParseShow $rel[0]; $shows[$key2] = PR-MatchShow $Db $f.Title $f.Year }
+                    if ($idn) {
+                        $shows[$key2] = PR-MatchShowChecked $Db $seasons $cand.Title $cand.Year $epsAll
+                        if (-not $shows[$key2] -and $fileCand.Title -and (PR-Norm $fileCand.Title) -ne (PR-Norm $cand.Title)) { $shows[$key2] = PR-MatchShow $Db $fileCand.Title $fileCand.Year }   # fallback: the file's own name
+                    } else {
+                        $shows[$key2] = PR-MatchShow $Db $cand.Title $cand.Year
+                        if (-not $shows[$key2] -and $rel.Count -gt 1) { $f = PR-ParseShow $rel[0]; $shows[$key2] = PR-MatchShow $Db $f.Title $f.Year }
+                    }
                 }
                 $sh = $shows[$key2]
                 if (-not $sh) { $row.note = "unmatched: no TMDB show for `"$($cand.Title)`""; $rows.Add($row); continue }
                 $tid = $sh.Id; $sname = PR-StripYear ([string]$sh.Name); $sy = $sh.Year; $ssim = $sh.Sim
                 $prov = [string]$sh.Provider; if (-not $prov) { $prov = 'tmdb' }
                 $eps = PR-Season $Db $seasons $tid $s $prov
-                $ftitle = (PR-CleanTokens $stem.Substring($mend)) -join ' '
+                $ftitle = ((PR-CleanTokens $stem.Substring($mend)) -join ' ').Trim(' ', '-')   # ' - 1080p Bluray': no title left, not '-'
                 $notes = New-Object System.Collections.Generic.List[string]
-                $notes.Add("show `"$sname`" sim=$(PR-F2 $ssim)"); if ($prov -eq 'tvdb') { $notes.Add('source: TVDB') }; foreach ($x in $extra) { $notes.Add($x) }
+                $notes.Add("show `"$sname`" sim=$(PR-F2 $ssim)"); if ($prov -eq 'tvdb') { $notes.Add('source: TVDB') }; if ($sh.Check) { $notes.Add([string]$sh.Check) }; if ($extraNote) { $notes.Add($extraNote) }; foreach ($x in $extra) { $notes.Add($x) }
                 if (($e1 -eq 0 -or -not $eps.Map.ContainsKey($e1)) -and $ftitle -and $s -ne 0) {
                     $sp = PR-Season $Db $seasons $tid 0 $prov
                     $nf = PR-Norm $ftitle
@@ -582,7 +769,8 @@ function New-PRPlan {
                 }
                 $row.group_key = 'movie|' + $p.ToLowerInvariant(); $row.query = "$($pm.Title)|$($pm.Year)"
                 $mm = $null
-                if ($Force.ContainsKey($row.group_key)) { $fc = $Force[$row.group_key]; $mm = @{ Provider = [string]$fc.Provider; Id = $fc.Id; Title = (PR-Safe ([string]$fc.Title)); Year = $fc.Year; Conf = 'low'; Note = "chosen by you: `"$($fc.Title)`" ($($fc.Year))" } }
+                if ($Force.ContainsKey($row.group_key)) { $fc = $Force[$row.group_key]; $fcn = PR-NameTitle $Db ([string]$fc.Provider) 'movie' $fc.Id ([string]$fc.Title) $pm.Title; $mm = @{ Provider = [string]$fc.Provider; Id = $fc.Id; Title = (PR-Safe $fcn); Year = $fc.Year; Conf = 'low'; Note = "chosen by you: `"$($fc.Title)`" ($($fc.Year))" } }
+                elseif ($ov = Find-PROverride (PR-OvrMovieKeys $p $mroot)) { $ovn = PR-NameTitle $Db ([string]$ov.Provider) 'movie' $ov.Id ([string]$ov.Title) $pm.Title; $mm = @{ Provider = [string]$ov.Provider; Id = $ov.Id; Title = (PR-Safe $ovn); Year = $ov.Year; Conf = 'high'; Note = "your pick: `"$ovn`" ($($ov.Year))" }; $ovHit[$p] = 1 }   # remembered Choose match
                 elseif ($pm.Title) { $mm = PR-MatchMovie $Db $pm.Title $pm.Year }
                 $loose = $FolderLoose -and ((PR-Dir $p).TrimEnd('\').ToLowerInvariant() -eq $mroot.ToLowerInvariant())
                 if (-not $mm) {
@@ -633,7 +821,7 @@ function New-PRPlan {
     $ordered = @($rows | Where-Object { -not $ambig.ContainsKey($_.old_path) }) + @($rows | Where-Object { $ambig.ContainsKey($_.old_path) })
     foreach ($r in $ordered) {
         if (-not $r.new_path) { continue }
-        if ($r.new_path -ceq $r.old_path) { $r.new_path = ''; $r.note = 'already correctly named; skipped'; continue }
+        if ($r.new_path -ceq $r.old_path) { $r.new_path = ''; $r.note = $(if ($ovHit.ContainsKey($r.old_path)) { 'your pick; ' } else { '' }) + 'already correctly named; skipped'; continue }
         $k = $r.new_path.ToLowerInvariant()
         if ($ambig.ContainsKey($r.old_path) -and ((($existing.Contains($k)) -and ($k -ne $r.old_path.ToLowerInvariant())) -or ($taken.ContainsKey($k) -and -not $ambig.ContainsKey($taken[$k])) -or ($takenDir.ContainsKey((PR-Dir $k)) -and $takenDir[(PR-Dir $k)] -ne $r.old_path))) {
             $r.note = 'POSSIBLE REMAKE: no year in the file name and several films share this name, so it was not renamed (it would clash with another file). Add the year to the name and scan again; ' + $r.note; $r.new_path = ''; $r.confidence = 'low'; continue
@@ -662,6 +850,8 @@ function New-PRPlan {
     # sidecars left behind in folders with no video come last, so the ones next to (or in Subs under) their video get the plain names first
     $hasVid = { param($q) $dq = (PR-Dir $q).ToLowerInvariant(); if ($vidByDir.ContainsKey($dq)) { return $true }; if ((PR-Base $dq) -eq 'subs') { return $vidByDir.ContainsKey((PR-Dir $dq).ToLowerInvariant()) }; return $false }
     $sorted = [object[]](@($sorted | Where-Object { & $hasVid $_.P }) + @($sorted | Where-Object { -not (& $hasVid $_.P) }))
+    $stemLc = @{}; foreach ($r in $vids.Values) { $stemLc[$r.old_path] = (PR-SplitExt (PR-Base $r.old_path))[0].ToLowerInvariant() }   # video name stems, once
+    $allMov = $null; $movIdx = $null; $script:PR_TK_CACHE = New-Object 'System.Collections.Generic.Dictionary[string,object]'
     $sn = 0
     foreach ($item in $sorted) {
         $sn++; if ($sn % 50 -eq 0) { PR-Progress $sn $sorted.Count 'Matching subtitles' }
@@ -672,7 +862,7 @@ function New-PRPlan {
             $rows.Add($row); continue
         }
         $v = $null; $suffix = $null; $how = ''; $subsUnd = $false; $untagged = $false
-        $cands = @(); if ($vidByDir.ContainsKey($d.ToLowerInvariant())) { $cands = @($vidByDir[$d.ToLowerInvariant()] | Where-Object { $fn.ToLowerInvariant().StartsWith((PR-SplitExt (PR-Base $_.old_path))[0].ToLowerInvariant(), [StringComparison]::Ordinal) }) }
+        $cands = @(); $fnl = $fn.ToLowerInvariant(); if ($vidByDir.ContainsKey($d.ToLowerInvariant())) { $cands = @(foreach ($cv in $vidByDir[$d.ToLowerInvariant()]) { if ($fnl.StartsWith($stemLc[$cv.old_path], [StringComparison]::Ordinal)) { $cv } }) }
         $last2 = @($parts | Select-Object -Last 2 | ForEach-Object { $_.ToLowerInvariant() })
         if ($cands.Count -gt 0) {
             $bestLen = -1; foreach ($c in $cands) { $L = (PR-SplitExt (PR-Base $c.old_path))[0].Length; if ($L -gt $bestLen) { $bestLen = $L; $v = $c } }
@@ -709,12 +899,12 @@ function New-PRPlan {
             } else {
                 # no video here: look for the movie elsewhere (by the sidecar's own name, then by its folder name)
                 $fold = $parts[-1]; if ($fold -ieq 'subs' -and $parts.Count -ge 2) { $fold = $parts[-2] }
-                $allMov = @($vids.Values | Where-Object { $_.media_type -eq 'movie' })
-                $tm = $null; if ($sp.Title -and $sp.Year) { $tm = PR-TitleMatch $sp $allMov }
+                if ($null -eq $allMov) { $allMov = @($vids.Values | Where-Object { $_.media_type -eq 'movie' }); $movIdx = PR-TitleIndex $allMov }   # built once per scan
+                $tm = $null; if ($sp.Title -and $sp.Year) { $tm = PR-TitleMatch $sp $allMov $movIdx }
                 if (-not $tm -and $parts.Count -gt 2) {
                     $fp = PR-ParseMovie $fold
                     if (-not $fp.Year) { $fy = [regex]::Match($fold, '^(.+?)[ ._(\[-]+((?:19|20)\d\d)(?!\d)'); if ($fy.Success) { $fp = PR-ParseMovie ($fy.Groups[1].Value + ' ' + $fy.Groups[2].Value) } }   # 'Superman 2025-1080p x265'
-                    $tm = PR-TitleMatch $fp $allMov
+                    $tm = PR-TitleMatch $fp $allMov $movIdx
                 }
                 if ($tm -and $tm.Year) { $pick = $tm.V; $reattach = 'other'; $rhigh = $false; $why = " in another folder ('" + (PR-Base (PR-Dir $(if ($tm.V.new_path) { $tm.V.new_path } else { $tm.V.old_path }))) + "'): same title and year - verify" }
                 elseif ($tm) { $pick = $tm.V; $reattach = 'other'; $rhigh = $false; $why = " in another folder: same title, year differs - verify" }
@@ -746,7 +936,14 @@ function New-PRPlan {
                 else { $np = PR-FreeTarget $bs $tg $ex $p $taken $existing; if ($np -cne $plain) { $numbered = $true; $row.confidence = 'low'; $row.group_key = 'sc|' + $p.ToLowerInvariant() } }   # a different track under a new name: reviewed, never automatic
             }
             if ($v.fold_path) { $row.fold_path = PR-Join (PR-Dir $v.fold_path) $fn }   # loose subtitle follows its video into the folder
-            if ($taken.ContainsKey($np.ToLowerInvariant()) -or ($existing.Contains($np.ToLowerInvariant()) -and $np.ToLowerInvariant() -ne $p.ToLowerInvariant())) { $row.note = 'DUPLICATE sidecar target (same language already placed); left in place' }
+            if ($taken.ContainsKey($np.ToLowerInvariant()) -or ($existing.Contains($np.ToLowerInvariant()) -and $np.ToLowerInvariant() -ne $p.ToLowerInvariant())) {
+                $row.note = 'DUPLICATE sidecar target (same language already placed); left in place'
+                # Setup: Recycle duplicate subtitles during Full Run - only subtitles (never .nfo or videos), only inside the roots, never Z:
+                if ($script:PR_RECYCLE_DUPSUBS -and (PR-SplitExt $fn)[1] -ine '.nfo' -and (PR-NfoAllowed $p @($MoviesRoot, $SeriesRoot))) {
+                    $row.note = 'DUPLICATE sidecar target (same language already placed); will be recycled (Recycle Bin on Full Run; keeps ' + (PR-Base $np) + ')'
+                    Add-Member -InputObject $row -NotePropertyName dup_of -NotePropertyValue $np -Force   # the copy that is kept; checked again before recycling
+                }
+            }
             elseif ($np -ceq $p) { $row.note = 'sidecar already correctly named' }
             else {
                 $row.new_path = $np; $taken[$np.ToLowerInvariant()] = $p
@@ -769,7 +966,13 @@ function New-PRPlan {
         elseif ($r.media_type -eq 'sidecar') { $r.note = ([string]$r.note).TrimEnd() + ' (folder case fix)' }
         else { $r.note = 'folder case fix; ' + $r.note }
     }
+    foreach ($r in $rows) {   # remembered picks: applied and ticked
+        $isPick = $ovHit.ContainsKey($r.old_path)
+        if (-not $isPick -and $r.media_type -eq 'episode' -and [string]$r.group_key -like 'show|*') { $sk = ([string]$r.group_key).Substring(5); if ($shows.ContainsKey($sk) -and $shows[$sk] -and $shows[$sk].Pick) { $isPick = $true; if ($r.new_path) { $r.confidence = 'high'; $r.note = 'your pick; ' + $r.note } } }
+        if ($isPick -and $r.new_path) { $r.accepted = 'yes' }
+    }
     if ($Force.Count) { foreach ($r in $rows) { if ($r.group_key -and $Force.ContainsKey($r.group_key) -and $r.new_path) { $r.accepted = 'yes'; $r.confidence = 'low'; if ($r.media_type -eq 'episode') { $r.note = 'chosen by you; ' + $r.note } }  } }   # a match the user picked counts as accepted
+    if ($script:PR_SEASON_FIX -and $sroot) { foreach ($sr in (Get-PRSeasonFolderRows $sroot)) { $rows.Add($sr) } }   # Setup: Standardize season folder names - one row per folder
     PR-Progress 1 1 'Done'
     return ,$rows.ToArray()
 }
@@ -803,10 +1006,24 @@ function PR-TitleKey([string]$t) {
     $w = @((PR-Norm $t).Split(' ') | Where-Object { $_ -and $_ -ne 'part' } | ForEach-Object { if ($rm.ContainsKey($_)) { $rm[$_] } else { $_ } })
     return ($w -join ' ')
 }
-function PR-TitleMatch($sp, $videos) {
+$script:PR_TK_CACHE = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+function PR-TitleKeyOf($x) {
+    # title key and year of a video's (new or old) name, parsed once per name
+    $vb = $x.new_path; if (-not $vb) { $vb = $x.old_path }
+    $c = $null; if ($script:PR_TK_CACHE.TryGetValue($vb, [ref]$c)) { return $c }
+    $vp = PR-ParseMovie (PR-SplitExt (PR-Base $vb))[0]; $kk = ''; if ($vp.Title) { $kk = PR-TitleKey $vp.Title }
+    $c = [pscustomobject]@{ K = $kk; Y = $vp.Year }; $script:PR_TK_CACHE[$vb] = $c; return $c
+}
+function PR-TitleIndex($videos) {
+    $ix = @{}; foreach ($x in $videos) { $tk = PR-TitleKeyOf $x; if (-not $tk.K) { continue }; if (-not $ix.ContainsKey($tk.K)) { $ix[$tk.K] = New-Object System.Collections.Generic.List[object] }; $ix[$tk.K].Add([pscustomobject]@{ V = $x; Y = $tk.Y }) }
+    return $ix
+}
+function PR-TitleMatch($sp, $videos, $Index = $null) {
     if (-not $sp -or -not $sp.Title) { return $null }
     $k = PR-TitleKey $sp.Title; if (-not $k) { return $null }
-    $hits = @(); foreach ($x in $videos) { $vb = $x.new_path; if (-not $vb) { $vb = $x.old_path }; $vp = PR-ParseMovie (PR-SplitExt (PR-Base $vb))[0]; if ($vp.Title -and (PR-TitleKey $vp.Title) -eq $k) { $hits += [pscustomobject]@{ V = $x; Y = $vp.Year } } }
+    $hits = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $Index) { if ($Index.ContainsKey($k)) { foreach ($h in $Index[$k]) { $hits.Add($h) } } }   # prebuilt title index (same hits, same order)
+    else { foreach ($x in $videos) { $tk = PR-TitleKeyOf $x; if ($tk.K -and $tk.K -eq $k) { $hits.Add([pscustomobject]@{ V = $x; Y = $tk.Y }) } } }
     $yh = @($hits | Where-Object { $sp.Year -and $_.Y -and [int]$_.Y -eq [int]$sp.Year })
     if ($yh.Count -eq 1) { return @{ V = $yh[0].V; Year = $true } }
     if ($yh.Count -eq 0 -and $hits.Count -eq 1) { return @{ V = $hits[0].V; Year = $false } }
@@ -883,16 +1100,104 @@ function Get-PRUnmatchedLine($rows) {
 }
 function Get-PRSummary($rows) {
     $t = 0; $h = 0; $s = 0; $a = 0; $rc = Get-PRReviewCounts $rows; $cf = @{}
+    $sfn = @($rows | Where-Object { (Test-PRSeasonRow $_) -and $_.new_path }).Count
     foreach ($r in $rows) {
+        if (Test-PRSeasonRow $r) { continue }
         $t++
         if (Test-PRCaseOnly $r) { $cf[(PR-CaseFolderPair $r.old_path $r.new_path)[1].ToLowerInvariant()] = 1 }
         elseif ($r.new_path) { if ($r.confidence -eq 'high') { $h++ } } else { $s++ }
         if ($r.note -like '*already correctly named*') { $a++ }
     }
-    return "Result: $h ready to rename (high confidence), $($cf.Count) folder name(s) to fix (letter case), $($rc.Total) movie(s)/show(s) to review ($($rc.Low) low-confidence matches, $($rc.NoMatch) with no match), $s file(s) left as they are (unmatched or no change needed; $a already correctly named), $t total."
+    return "Result: $h ready to rename (high confidence), $($cf.Count) folder name(s) to fix (letter case), $(if ($sfn) { "$sfn season folder(s) to standardize, " })$($rc.Total) movie(s)/show(s) to review ($($rc.Low) low-confidence matches, $($rc.NoMatch) with no match), $s file(s) left as they are (unmatched or no change needed; $a already correctly named), $t total."
 }
 
 # ---------- file system scan ----------
+# ---------- parallel prefetch of online lookups (first scan with an empty cache) ----------
+# The scan itself is unchanged: it asks the same questions in the same order. Before it runs, the same matching code is
+# dry-run per movie / show with the cache in 'collect' mode: the first request not in the cache is noted and that lookup stops.
+# The noted requests are fetched by a pool of workers at the same overall rate, stored in the cache, and the dry run is
+# repeated until nothing new is needed. The real scan then finds every answer in the cache, so its results are identical.
+function Invoke-PRFetchBatch($db, $Reqs, [int]$Workers = 8) {
+    $code = $script:PR_ENGINE_CODE; $list = @($Reqs)
+    if (-not $code -or $list.Count -lt 4 -or $Workers -le 1) {   # few requests (or no engine text): fetch here, one by one
+        foreach ($q in $list) { try { if ($q.Provider -eq 'tvdb') { [void](PR-TvdbGet $db $q.Path $q.Params) } else { [void](PR-TmdbGet $db $q.Path $q.Params) } } catch { PR-Log "Lookup failed: $($q.Path) $($_.Exception.Message)" } }
+        return
+    }
+    $tok = ''; if (@($list | Where-Object { $_.Provider -eq 'tvdb' }).Count -and $db.Tvdb.Key) { try { $tok = PR-TvdbToken $db } catch { PR-Log "TVDB login failed: $($_.Exception.Message)" } }
+    $n = [math]::Min($Workers, $list.Count)
+    $pool = [runspacefactory]::CreateRunspacePool(1, $n); $pool.Open()
+    $job = {
+        param($code, $cfg, $batch)
+        . ([scriptblock]::Create($code))
+        $d = New-PRTmdb -Key $cfg.Key -CachePath '' -TvdbKey $cfg.TvdbKey -TvdbPin $cfg.TvdbPin -Source $cfg.Source -UsTitles $cfg.UsTitles
+        $d.GapMs = $cfg.GapMs; $d.TmdbBase = $cfg.TmdbBase; if ($cfg.Token) { $d.Tvdb.Token = $cfg.Token }
+        $err = New-Object System.Collections.Generic.List[string]
+        foreach ($q in $batch) { try { if ($q.Provider -eq 'tvdb') { [void](PR-TvdbGet $d $q.Path $q.Params) } else { [void](PR-TmdbGet $d $q.Path $q.Params) } } catch { $err.Add("$($q.Path): $($_.Exception.Message)") } }
+        $out = New-Object System.Collections.Generic.List[object]; foreach ($kv in $d.Cache.GetEnumerator()) { $out.Add([pscustomobject]@{ K = $kv.Key; V = $kv.Value }) }
+        return [pscustomobject]@{ Entries = $out.ToArray(); Calls = $d.Calls; Errors = $err.ToArray() }
+    }
+    # each worker keeps its own gap, so together they stay at the single-worker rate x ~1.3 (TMDB allows ~40 requests/s; 429 is retried)
+    $cfg = @{ Key = $db.Key; TvdbKey = $db.Tvdb.Key; TvdbPin = $db.Tvdb.Pin; Source = $db.Source; UsTitles = [bool]$db.UsTitles; GapMs = [int]([math]::Ceiling(25 * $n)); TmdbBase = $db.TmdbBase; Token = $tok }
+    $chunks = @(); for ($i = 0; $i -lt $n; $i++) { $chunks += , (New-Object System.Collections.Generic.List[object]) }
+    for ($i = 0; $i -lt $list.Count; $i++) { $chunks[$i % $n].Add($list[$i]) }
+    $hs = @(); foreach ($c in $chunks) { $ps = [powershell]::Create(); $ps.RunspacePool = $pool; [void]$ps.AddScript($job.ToString()).AddArgument($code).AddArgument($cfg).AddArgument($c.ToArray()); $hs += @{ PS = $ps; H = $ps.BeginInvoke() } }
+    try {
+        foreach ($h in $hs) {
+            while (-not $h.H.IsCompleted) { if (PR-Cancelled) { foreach ($x in $hs) { try { $x.PS.Stop() } catch { } }; throw 'Cancelled' }; Start-Sleep -Milliseconds 50 }
+            foreach ($r in @($h.PS.EndInvoke($h.H))) { if (-not $r) { continue }; foreach ($e in @($r.Entries)) { if ($e -and -not $db.Cache.ContainsKey($e.K)) { $db.Cache[$e.K] = $e.V; $db.Dirty++ } }; $db.Calls += [int]$r.Calls; foreach ($m in @($r.Errors)) { PR-Log "Lookup failed: $m" } }
+        }
+    } finally { foreach ($h in $hs) { $h.PS.Dispose() }; $pool.Close(); $pool.Dispose() }
+}
+function Invoke-PRPrefetch($db, [string[]]$Paths, [string]$MoviesRoot, [string]$SeriesRoot, [int]$Workers = 8) {
+    $mroot = ([string]$MoviesRoot).TrimEnd('\'); $sroot = ([string]$SeriesRoot).TrimEnd('\')
+    $movies = @{}; $shows = @{}
+    $vids = @($Paths | Where-Object { $_ -and -not $script:PR_SKIP.IsMatch($_) -and $script:PR_VIDEO -contains (PR-SplitExt $_)[1].ToLowerInvariant() })
+    $ident = Get-PRShowIdentity $vids $sroot
+    foreach ($p in $Paths) {
+        if (-not $p -or $script:PR_SKIP.IsMatch($p)) { continue }
+        $e = (PR-SplitExt $p)[1].ToLowerInvariant(); if ($script:PR_VIDEO -notcontains $e) { continue }
+        $stem = (PR-SplitExt (PR-Base $p))[0]; $m = $script:PR_EP.Match($stem)
+        if ($m.Success -and $sroot) {
+            $c = PR-ParseShow $stem.Substring(0, $m.Index); $idn = $ident[$p.ToLowerInvariant()]
+            if ($idn) { $c = @{ Title = $idn.Title; Year = $idn.Year } }
+            if (-not $c.Title) { continue }
+            $sn = $(if ($m.Groups[1].Success) { [int]$m.Groups[1].Value } else { [int]$m.Groups[4].Value })
+            $k = (PR-Norm $c.Title) + '|' + $c.Year; if (-not $shows.ContainsKey($k)) { $shows[$k] = @{ T = $c.Title; Y = $c.Year; S = @{}; E = $(if ($idn) { $idn.Eps } else { $null }) } }; $shows[$k].S[$sn] = 1
+        } elseif ($mroot -and (PR-Under $p $mroot)) {
+            $pm = PR-ParseMovie $stem
+            if (-not $pm.Year -and $pm.Title) { $pd = PR-Dir $p; if ($pd.TrimEnd('\').ToLowerInvariant() -ne $mroot.ToLowerInvariant()) { $fp = PR-ParseMovie (PR-Base $pd); if ($fp.Year -and $fp.Title -and (PR-Sim $fp.Title $pm.Title) -ge 0.7) { $pm = @{ Title = $pm.Title; Year = $fp.Year } } } }
+            if ($pm.Title) { $movies["$($pm.Title)|$($pm.Year)"] = @{ T = $pm.Title; Y = $pm.Year } }
+        }
+    }
+    $units = New-Object System.Collections.Generic.List[object]
+    foreach ($v in $movies.Values) { $units.Add(@{ K = 'm'; T = $v.T; Y = $v.Y }) }
+    foreach ($v in $shows.Values) { $units.Add(@{ K = 's'; T = $v.T; Y = $v.Y; S = @($v.S.Keys); E = $v.E }) }
+    $total = 0
+    for ($wave = 1; $wave -le 8 -and $units.Count; $wave++) {
+        if (PR-Cancelled) { throw 'Cancelled' }
+        PR-Progress $wave 8 "Looking up online (round $wave, $($units.Count) titles)"
+        $db.Collect = @{}; $next = New-Object System.Collections.Generic.List[object]
+        try {
+            foreach ($u in $units) {
+                $pending = $false
+                try {
+                    if ($u.K -eq 'm') { [void](PR-MatchMovie $db $u.T $u.Y) }
+                    else {
+                        $seen = @{}; $sh = PR-MatchShowChecked $db $seen $u.T $u.Y $u.E
+                        if ($sh) { foreach ($sn in $u.S) { try { [void](PR-Season $db $seen $sh.Id ([int]$sn) $sh.Provider) } catch { if ($_.Exception.Message -eq 'PRCollect') { $pending = $true } else { throw } } } }
+                    }
+                } catch { if ($_.Exception.Message -eq 'PRCollect') { $pending = $true } }   # other errors: the real scan reports them
+                if ($pending) { $next.Add($u) }
+            }
+        } finally { $reqs = @($db.Collect.Values); $db.Collect = $null }
+        if ($reqs.Count -eq 0) { break }
+        $total += $reqs.Count
+        Invoke-PRFetchBatch $db $reqs $Workers
+        $units = $next
+    }
+    if ($db.Dirty) { Save-PRTmdbCache $db }
+    return $total
+}
 function Get-PRFiles([string[]]$Roots) {
     $out = New-Object System.Collections.Generic.List[string]
     foreach ($root in $Roots) {
@@ -919,11 +1224,24 @@ function Export-PRCsv($rows, [string]$path, [string[]]$columns) {
         foreach ($r in $rows) { $sw.Write((($columns | ForEach-Object { PR-CsvField $r.$_ }) -join ',') + "`r`n") }
     } finally { $sw.Close() }
 }
+function Add-PRCsvRows($rows, [string]$path, [string[]]$columns, [ref]$Written) {
+    # appends only the rows not yet written (header first time), so the undo log grows in place instead of being rewritten after every move
+    if ($Written.Value -ge $rows.Count) { return }
+    $new = ($Written.Value -eq 0)
+    $sw = New-Object IO.StreamWriter($path, (-not $new), (New-Object Text.UTF8Encoding($new)))
+    try {
+        if ($new) { $sw.Write(($columns -join ',') + "`r`n") }
+        for ($i = $Written.Value; $i -lt $rows.Count; $i++) { $r = $rows[$i]; $f = foreach ($c in $columns) { PR-CsvField $r.$c }; $sw.Write(($f -join ',') + "`r`n") }
+        $sw.Flush()
+    } finally { $sw.Close() }
+    $Written.Value = $rows.Count
+}
 function Export-PRPlan($rows, [string]$path) { Export-PRCsv $rows $path @('old_path','new_path','media_type','tmdb_id','confidence','note','fold_path','accepted','group_key') }
 # where a Full Run puts a row: the planned rename, or for a loose movie whose rename is not applied, just its own folder (name kept)
 # Setup option "Full Run applies only ticked rows": off = high-confidence + accepted + folder-only moves (default); on = only rows ticked Accept
 $script:PR_ONLY_TICKED = $false
 function PR-ApplyTarget($r, [bool]$HighOnly) {
+    if (Test-PRSkipped $r) { return '' }   # unticked in the grid: this file is left alone
     if ($script:PR_ONLY_TICKED) {
         if (-not ($r.PSObject.Properties['accepted'] -and $r.accepted -eq 'yes')) { return '' }
         if ($r.new_path) { return [string]$r.new_path }
@@ -936,6 +1254,67 @@ function PR-ApplyTarget($r, [bool]$HighOnly) {
 }
 # counts for the Full Run confirmation: High = renamed as high confidence (or everything when not high-only), Accepted = low ones you accepted, Folder = only put into their own folder
 # a row whose only change is the letter case of a folder (the file name itself is already right)
+# ---------- what Full Run will do with a row (the grid's Accept box shows exactly this) ----------
+# skip = 'yes': the user unticked a row Full Run would otherwise act on (that file / folder only, or a movie / show with its subtitles)
+function Test-PRSkipped($r) { return ($r.PSObject.Properties['skip'] -and [string]$r.skip -eq 'yes') }
+function Get-PRActKind($r) {
+    # 'nfo' / 'dupsub' / 'season' rows are acted on by their Setup option; 'auto' = renamed without a tick; 'accept' = needs a tick; '' = nothing to do
+    $n = [string]$r.note
+    if ($n.StartsWith('nfo: delete')) { return 'nfo' }
+    if (Test-PRDupSubRow $r) { return 'dupsub' }
+    if (Test-PRSeasonRow $r) { if ($r.new_path) { return 'season' }; return '' }
+    if (-not ($r.new_path -or ($r.PSObject.Properties['fold_path'] -and $r.fold_path))) { return '' }
+    if ($r.new_path -and $r.confidence -ne 'high') { return 'accept' }
+    return 'auto'
+}
+function Get-PROptionOff($r) {
+    # the Setup option a row depends on, when it is off ('' when not)
+    switch (Get-PRActKind $r) { 'nfo' { if (-not $script:PR_DELETE_NFO) { return 'Delete .nfo files' } } 'dupsub' { if (-not $script:PR_RECYCLE_DUPSUBS) { return 'Recycle duplicate subtitles' } } 'season' { if (-not $script:PR_SEASON_FIX) { return 'Standardize season folder names' } } }
+    return ''
+}
+function Test-PRWillAct($r, [bool]$HighOnly = $true) {
+    # $true when the next Full Run will rename / move / recycle this row
+    $k = Get-PRActKind $r; if (-not $k -or (Test-PRSkipped $r)) { return $false }
+    if (Get-PROptionOff $r) { return $false }
+    if ($script:PR_ONLY_TICKED -and $k -ne 'nfo' -and $k -ne 'dupsub') { return ($r.PSObject.Properties['accepted'] -and $r.accepted -eq 'yes') }
+    if ($k -eq 'accept') { return (-not $HighOnly) -or ($r.PSObject.Properties['accepted'] -and $r.accepted -eq 'yes') }
+    return $true
+}
+function Get-PRRowState($r, [bool]$HighOnly = $true) {
+    # the four answers above in one pass (for the grid: thousands of rows): @(act kind, option off, will act, skipped)
+    # must give exactly what Get-PRActKind, Get-PROptionOff, Test-PRWillAct and Test-PRSkipped give (tests\Test-RowState.ps1)
+    $n = [string]$r.note; $pp = $r.PSObject.Properties
+    $sk = [bool]($pp['skip'] -and [string]$r.skip -eq 'yes')
+    if ($n.StartsWith('nfo: delete')) { $k = 'nfo' }
+    elseif ($n.StartsWith('DUPLICATE sidecar target') -and $n.Contains('will be recycled') -and $pp['dup_of'] -and [string]$r.dup_of) { $k = 'dupsub' }
+    elseif ($r.media_type -eq 'season folder') { $k = $(if ($r.new_path) { 'season' } else { '' }) }
+    elseif (-not ($r.new_path -or ($pp['fold_path'] -and $r.fold_path))) { $k = '' }
+    elseif ($r.new_path -and $r.confidence -ne 'high') { $k = 'accept' }
+    else { $k = 'auto' }
+    $off = ''
+    if ($k -eq 'nfo') { if (-not $script:PR_DELETE_NFO) { $off = 'Delete .nfo files' } }
+    elseif ($k -eq 'dupsub') { if (-not $script:PR_RECYCLE_DUPSUBS) { $off = 'Recycle duplicate subtitles' } }
+    elseif ($k -eq 'season') { if (-not $script:PR_SEASON_FIX) { $off = 'Standardize season folder names' } }
+    $acc = [bool]($pp['accepted'] -and $r.accepted -eq 'yes')
+    if (-not $k -or $sk -or $off) { $w = $false }
+    elseif ($script:PR_ONLY_TICKED -and $k -ne 'nfo' -and $k -ne 'dupsub') { $w = $acc }
+    elseif ($k -eq 'accept') { $w = (-not $HighOnly) -or $acc }
+    else { $w = $true }
+    return @($k, $off, $w, $sk)
+}
+function Set-PRRowAct($Rows, $Row, [bool]$On, [bool]$HighOnly = $true) {
+    # tick / untick one row as the grid shows it. Option rows (nfo, duplicate subtitle, season folder) and loose files: that row only.
+    # A movie / show: the whole group (its subtitles follow, so names stay consistent). Returns the number of rows changed.
+    $k = Get-PRActKind $Row; if (-not $k) { return 0 }
+    $set = @($Row)
+    if (($k -eq 'auto' -or $k -eq 'accept') -and $Row.group_key) { $set = @(foreach ($x in $Rows) { if ($x.group_key -eq $Row.group_key -and (Get-PRActKind $x) -in 'auto', 'accept') { $x } }) }
+    foreach ($r in $set) {
+        if (-not $r.PSObject.Properties['skip']) { Add-Member -InputObject $r -NotePropertyName skip -NotePropertyValue '' -Force }
+        if ($On) { $r.skip = ''; if ((Get-PRActKind $r) -eq 'accept' -or $script:PR_ONLY_TICKED) { $r.accepted = 'yes' } }
+        else { $r.skip = 'yes'; if ($r.PSObject.Properties['accepted']) { $r.accepted = '' } }
+    }
+    return $set.Count
+}
 function Test-PRCaseOnly($r) { $o = [string]$r.old_path; $n = [string]$r.new_path; return ([bool]$n -and $o -ieq $n -and $o -cne $n -and (PR-Base $o) -ceq (PR-Base $n)) }
 function PR-CaseFolderPair([string]$o, [string]$n) {
     # first folder whose case differs: returns @(old full folder, new full folder)
@@ -945,9 +1324,12 @@ function PR-CaseFolderPair([string]$o, [string]$n) {
 }
 function Get-PRRunCounts($Rows, [bool]$HighOnly) {
     # High / Accepted / Folder count files; CaseFolders counts folders (one per folder, not per file); Total = files that really move
-    $c = @{ High = 0; Accepted = 0; Folder = 0; Total = 0; CaseFolders = 0 }; $cf = @{}
+    $c = @{ High = 0; Accepted = 0; Folder = 0; Total = 0; CaseFolders = 0; SeasonFolders = 0 }; $cf = @{}
+    $sf = @{}; foreach ($r in $Rows) { if ((Test-PRSeasonRow $r) -and $r.new_path) { $sf[([string]$r.new_path).ToLowerInvariant()] = 1 } }
     foreach ($r in $Rows) {
+        if (Test-PRSeasonRow $r) { if ($r.new_path -and -not (Test-PRSkipped $r) -and (-not $script:PR_ONLY_TICKED -or $r.accepted -eq 'yes')) { $c.SeasonFolders++ }; continue }
         $t = PR-ApplyTarget $r $HighOnly; if (-not $t) { continue }
+        if ($t -ceq [string]$r.new_path -and (Test-PRCaseOnly $r) -and $sf.ContainsKey((PR-CaseFolderPair $r.old_path $r.new_path)[1].ToLowerInvariant())) { continue }   # covered by the season folder rename
         if ($t -ceq [string]$r.new_path -and (Test-PRCaseOnly $r)) { $cf[(PR-CaseFolderPair $r.old_path $r.new_path)[1].ToLowerInvariant()] = 1; continue }
         $c.Total++
         if ($t -cne [string]$r.new_path) { $c.Folder++ } elseif ((-not $HighOnly -and -not $script:PR_ONLY_TICKED) -or $r.confidence -eq 'high') { $c.High++ } else { $c.Accepted++ }
@@ -988,12 +1370,14 @@ function Get-PRCandidates($Db, [string]$Kind, [string]$Title, $Year) {
     $out = New-Object System.Collections.Generic.List[object]; $seen = @{}
     if (-not $Title) { return }
     $path = '/search/movie'; if ($Kind -eq 'show') { $path = '/search/tv' }
+    $idm = [regex]::Match($Title, '^\s*(?i:(tmdb|tvdb)\s*[:#]?)?\s*(\d+)\s*$')
+    if ($idm.Success) { $c = Get-PRById $Db $Kind $(if ($idm.Groups[1].Success) { $idm.Groups[1].Value.ToLowerInvariant() } else { 'tmdb' }) $idm.Groups[2].Value; if ($c) { return @($c) }; return @() }   # '136418', 'tmdb:136418', 'tvdb:1884'
     $ys = @($null); if ($Year) { $ys = @([int]$Year, $null) }
     foreach ($pv in (PR-Providers $Db $(if ($Kind -eq 'show') { 'tv' } else { 'movie' }))) {
         foreach ($y in $ys) {
             $q = @{ query = $Title }
             if ($Kind -eq 'show') { $q.first_air_date_year = $y } else { $q.primary_release_year = $y; $q.include_adult = 'false' }
-            $resp = $null; try { $resp = PR-Api $Db $pv $path $q } catch { PR-Log "[$pv] search failed for `"$Title`": $($_.Exception.Message)"; continue }
+            $resp = $null; try { $resp = PR-Api $Db $pv $path $q } catch { if ($_.Exception.Message -eq 'PRCollect') { throw }; PR-Log "[$pv] search failed for `"$Title`": $($_.Exception.Message)"; continue }
             foreach ($r in @(@($resp.results) | Where-Object { $_ } | Select-Object -First 8)) {
                 $k = "$pv|$($r.id)"; if ($seen.ContainsKey($k)) { continue }; $seen[$k] = $true
                 if ($Kind -eq 'show') { $nm = [string]$r.name; $ry = PR-Year $r.first_air_date } else { $nm = [string]$r.title; $ry = PR-Year $r.release_date }
@@ -1007,12 +1391,29 @@ function Get-PRCandidates($Db, [string]$Kind, [string]$Title, $Year) {
     $sorted = @($arr | Sort-Object -Property @{ Expression = { $_.Sim }; Descending = $true }, @{ Expression = { if ($Year -and $_.Year -eq [int]$Year) { 0 } else { 1 } } })
     return $sorted   # callers wrap in @()
 }
+function Get-PRById($Db, [string]$Kind, [string]$Provider, [string]$Id) {
+    try {
+        if ($Provider -eq 'tvdb') {
+            if (-not $Db.Tvdb.Key) { PR-Log 'TVDB ID search needs a TVDB API key in Setup.'; return $null }
+            $j = PR-TvdbRaw $Db $(if ($Kind -eq 'show') { "/series/$Id/extended" } else { "/movies/$Id/extended" }) @{ meta = 'translations' }
+            if (-not $j -or -not $j.data) { return $null }
+            $nm = [string]$j.data.name; try { $tr = @($j.data.translations.nameTranslations | Where-Object { $_.language -eq 'eng' -and $_.name }); if ($tr.Count) { $nm = [string]$tr[0].name } } catch { }
+            $y = [string]$j.data.year; if (-not $y -and $j.data.firstAired) { $y = ([string]$j.data.firstAired).Substring(0, 4) }
+            return [pscustomobject]@{ Provider = 'tvdb'; Id = $Id; Title = (PR-StripYear $nm); Year = $(if ($y -match '^\d{4}$') { [int]$y } else { $null }); Overview = ''; Sim = 1.0 }
+        }
+        $d = PR-Api $Db 'tmdb' $(if ($Kind -eq 'show') { "/tv/$Id" } else { "/movie/$Id" }) @{}
+        if (-not $d) { return $null }
+        if ($Kind -eq 'show') { $nm = [string]$d.name; $y = PR-Year $d.first_air_date } else { $nm = [string]$d.title; $y = PR-Year $d.release_date }
+        if (-not $nm) { return $null }
+        return [pscustomobject]@{ Provider = 'tmdb'; Id = $d.id; Title = $nm; Year = $y; Overview = ''; Sim = 1.0 }
+    } catch { PR-Log "ID lookup failed for $Provider $Id : $($_.Exception.Message)"; return $null }
+}
 # re-plan one group (a movie, or a whole show) with the match the user chose; the rest of the plan is kept as it is
 function Update-PRPlanGroup($Rows, [string]$GroupKey, $Choice, $Db, [string]$MoviesRoot, [string]$SeriesRoot, [bool]$ProbeReal = $false, [bool]$FolderLoose = $true) {
     $mine = @($Rows | Where-Object { $_.group_key -eq $GroupKey })
     if ($mine.Count -eq 0) { return ,@($Rows) }
     $others = @($Rows | Where-Object { $_.group_key -ne $GroupKey })
-    $new = New-PRPlan -Paths @($mine | ForEach-Object { $_.old_path }) -MoviesRoot $MoviesRoot -SeriesRoot $SeriesRoot -Db $Db -ProbeReal $ProbeReal -FolderLoose $FolderLoose -Force @{ $GroupKey = $Choice } -OtherPaths @($others | ForEach-Object { $_.old_path })   # New-PRPlan returns the row array as one object
+    $new = New-PRPlan -Paths @($mine | ForEach-Object { $_.old_path }) -MoviesRoot $MoviesRoot -SeriesRoot $SeriesRoot -Db $Db -ProbeReal $ProbeReal -FolderLoose $FolderLoose -Force $(if ($null -ne $Choice) { @{ $GroupKey = $Choice } } else { @{} }) -OtherPaths @($others | ForEach-Object { $_.old_path })   # New-PRPlan returns the row array as one object
     $used = @{}; foreach ($o in $others) { foreach ($t in $o.new_path, $o.fold_path) { if ($t) { $used[$t.ToLowerInvariant()] = $o.old_path } } }
     foreach ($r in $new) { if ($r.new_path -and $used.ContainsKey($r.new_path.ToLowerInvariant())) { $r.note = "DUPLICATE: same target as $($used[$r.new_path.ToLowerInvariant()]); " + $r.note; $r.new_path = ''; $r.accepted = '' } }
     $byOld = @{}; foreach ($r in $new) { $byOld[$r.old_path.ToLowerInvariant()] = $r }
@@ -1048,6 +1449,94 @@ function PR-MoveDirCase([string]$From, [string]$To) {
     $tmp = $From + '.renametmp' + [guid]::NewGuid().ToString('N').Substring(0, 6)
     [IO.Directory]::Move($From, $tmp); [IO.Directory]::Move($tmp, $To)
 }
+# ---------- season folders (Setup: Standardize season folder names) ----------
+$script:PR_SEASON_FIX = $false
+$script:PR_SEASON_RX = [regex]'(?i)^(?:season|series|s)[ ._-]*0*(\d{1,3})(?:[ ._-]*\(\d{4}\))?$'
+$script:PR_SEASON_FORMAT_DEFAULT = 'Season {NN}'
+$script:PR_SEASON_FORMAT = 'Season {NN}'
+function Test-PRSeasonFormat([string]$Format) {
+    # valid: exactly one of {N} / {NN} / {NNN}, no characters Windows forbids in a folder name, not empty, no trailing space or dot. Returns '' when valid, else the reason.
+    if ([string]::IsNullOrWhiteSpace($Format)) { return 'The format is empty.' }
+    $toks = [regex]::Matches($Format, '\{N{1,3}\}')
+    if ($toks.Count -ne 1) { return 'Use exactly one number token: {N}, {NN} or {NNN}.' }
+    $rest = $Format.Remove($toks[0].Index, $toks[0].Length)
+    if ($rest -match '[{}]') { return 'Unknown token: only {N}, {NN} or {NNN} are allowed.' }
+    if ($rest.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $rest -match '[\\/:*?"<>|]') { return 'The format contains a character that is not allowed in folder names (\ / : * ? " < > |).' }
+    if ($Format -ne $Format.Trim() -or $Format.EndsWith('.')) { return 'The format cannot start or end with a space, or end with a dot.' }
+    return ''
+}
+function PR-FormatSeason([int]$n, [string]$Format = $script:PR_SEASON_FORMAT) {
+    if (Test-PRSeasonFormat $Format) { $Format = $script:PR_SEASON_FORMAT_DEFAULT }
+    $m = [regex]::Match($Format, '\{N{1,3}\}'); $w = $m.Length - 2
+    return $Format.Substring(0, $m.Index) + $n.ToString('0' * $w) + $Format.Substring($m.Index + $m.Length)
+}
+function PR-SeasonFormatRegex([string]$Format) {
+    # the format itself as a pattern ('Staffel {NN}' -> ^Staffel\s*0*(\d{1,3})$), so variants of a custom format are recognised too
+    if (Test-PRSeasonFormat $Format) { $Format = $script:PR_SEASON_FORMAT_DEFAULT }
+    $m = [regex]::Match($Format, '\{N{1,3}\}')
+    $pre = [regex]::Escape($Format.Substring(0, $m.Index).Trim()); $post = [regex]::Escape($Format.Substring($m.Index + $m.Length).Trim())
+    return [regex]('(?i)^' + $pre + '[ ._-]*0*(\d{1,3})[ ._-]*' + $post + '$')
+}
+function PR-SeasonFolderName([string]$Name, [string]$Dir) {
+    # 'Season 1', 'season1', 'S1', 'S01', 'Season_1', 'Series 1', 'Season 1 (2010)' -> 'Season 01'; 'Specials' / 'Season 0' -> 'Season 00' only when its episodes are named S00Exx; $null = leave as is
+    $n = -1; $m = $script:PR_SEASON_RX.Match($Name.Trim()); if (-not $m.Success) { $m = (PR-SeasonFormatRegex $script:PR_SEASON_FORMAT).Match($Name.Trim()) }
+    if ($m.Success) { $n = [int]$m.Groups[1].Value } elseif ($Name.Trim() -match '^(?i)specials?$') { $n = 0 }
+    if ($n -lt 0) { return $null }
+    if ($n -eq 0) {
+        $s00 = $false; try { foreach ($f in [IO.Directory]::GetFiles($Dir)) { if ([IO.Path]::GetFileName($f) -match '(?i)(?<![a-z0-9])S00E\d') { $s00 = $true; break } } } catch { }
+        if (-not $s00) { return $null }
+    }
+    return (PR-FormatSeason $n)
+}
+function Test-PRSeasonRow($r) { return ($r.media_type -eq 'season folder') }
+function Get-PRSeasonFolderRows([string]$SeriesRoot) {
+    # one row per season folder (Series\<show>\<season>) whose name does not match the season folder format; a target that already exists (or that another folder of the show will get) is a collision (never merged)
+    $out = New-Object System.Collections.Generic.List[object]
+    $rt = $SeriesRoot.TrimEnd('\'); if ((PR-Forbidden $rt) -or $rt.Length -le 3 -or -not [IO.Directory]::Exists($rt)) { return $out.ToArray() }
+    foreach ($show in @(try { [IO.Directory]::GetDirectories($rt) } catch { @() })) {
+        if (PR-SkipDir $show) { continue }
+        $planned = @{}
+        foreach ($sd in @(try { [IO.Directory]::GetDirectories($show) } catch { @() })) {
+            if (PR-SkipDir $sd) { continue }
+            $nm = [IO.Path]::GetFileName($sd); $want = PR-SeasonFolderName $nm $sd
+            if (-not $want -or $want -ceq $nm) { continue }
+            $to = $show + '\' + $want
+            $row = PR-NewRow $sd; $row.media_type = 'season folder'; $row.confidence = 'high'
+            if (($want -ine $nm -and [IO.Directory]::Exists($to)) -or $planned.ContainsKey($want.ToLowerInvariant())) { $row.note = "COLLISION: season folder '$nm' -> '$want', but '$want' already exists" + $(if ($planned.ContainsKey($want.ToLowerInvariant())) { " (another folder of this show becomes '$want')" } else { '' }) + '; not merged, left as is' }
+            else { $planned[$want.ToLowerInvariant()] = 1; $row.new_path = $to; $row.note = "season folder: '$nm' -> '$want'" + $(if ($want -ieq $nm) { ' (letter case)' } else { '' }) }
+            $out.Add($row)
+        }
+    }
+    return $out.ToArray()
+}
+function Invoke-PRSeasonFolders($Rows, $Log) {
+    # renames each season folder in place (same parent, no copying); case-only through a temporary name; the folder's and its parent's timestamps are kept
+    $done = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($Rows | Where-Object { (Test-PRSeasonRow $_) -and $_.new_path })) {
+        if (PR-Cancelled) { break }
+        if ($script:PR_ONLY_TICKED -and -not ($r.PSObject.Properties['accepted'] -and $r.accepted -eq 'yes')) { continue }
+        if (Test-PRSkipped $r) { PR-Log "Season folder left as is (unticked): $($r.old_path)"; continue }
+        $from = [string]$r.old_path; $to = [string]$r.new_path
+        if ((PR-Forbidden $from) -or (PR-NativeDir $from) -ine (PR-NativeDir $to)) { PR-Log "Season folder kept (protected or not the same parent): $from"; continue }
+        if (-not [IO.Directory]::Exists($from)) { PR-Log "SKIP season folder not found: $from"; continue }
+        $caseOnly = ($from -ieq $to)
+        if (-not $caseOnly -and ([IO.Directory]::Exists($to) -or [IO.File]::Exists($to))) { PR-Log "COLLISION season folder target exists, not merged: $to"; continue }
+        try {
+            $times = PR-TimesOf $from; $parent = PR-NativeDir $from; $pt = PR-TimesOf $parent
+            if ($caseOnly) { PR-MoveDirCase $from $to } else { [IO.Directory]::Move($from, $to) }
+            PR-SetTimes $to $times; PR-SetTimes $parent $pt
+            $Log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $from; new_path = $to; created_dir = ''; how = 'seasondir'; times = $times })
+            $done.Add([pscustomobject]@{ From = $from; To = $to })
+            PR-Log "Season folder renamed: $from -> $(PR-Base $to)"
+        } catch { PR-Log "FAILED season folder $from : $($_.Exception.Message)" }
+    }
+    return $done.ToArray()
+}
+function PR-MapSeasonPath([string]$p, $Map) {
+    foreach ($m in $Map) { if ($p.StartsWith($m.From + '\', [StringComparison]::OrdinalIgnoreCase)) { return $m.To + $p.Substring($m.From.Length) } }
+    return $p
+}
+function Get-PRSeasonLine($rows) { $n = @($rows | Where-Object { (Test-PRSeasonRow $_) -and $_.new_path }).Count; $c = @($rows | Where-Object { (Test-PRSeasonRow $_) -and -not $_.new_path }).Count; return "Season folders to standardize: $n" + $(if ($c) { " ($c collision(s) left as they are)" } else { '' }) }
 function PR-FixDirCase([string]$Dir, [string[]]$Roots) {
     # makes the existing folders under a library root match the letter case of $Dir (the root itself is never renamed)
     $done = New-Object System.Collections.Generic.List[object]
@@ -1109,10 +1598,11 @@ function PR-RecycleFile([string]$p) {
     Add-Type -AssemblyName Microsoft.VisualBasic
     [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
 }
-function Remove-PRNfoFiles([string[]]$Roots, $Log) {
+function Remove-PRNfoFiles([string[]]$Roots, $Log, $Skip = @{}) {
     $n = 0; $kept = 0
     foreach ($f in (Get-PRNfoFiles $Roots)) {
         if (PR-Cancelled) { break }
+        if ($Skip -and $Skip.ContainsKey($f.ToLowerInvariant())) { PR-Log "NFO kept (unticked): $f"; $kept++; continue }
         if (-not (PR-HasRecycleBin $f)) { PR-Log "NFO kept (no Recycle Bin on this drive): $f"; $kept++; continue }
         try {
             $parent = PR-NativeDir $f; $pt = PR-TimesOf $parent
@@ -1121,6 +1611,32 @@ function Remove-PRNfoFiles([string[]]$Roots, $Log) {
             $Log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $f; new_path = ''; created_dir = ''; how = 'recycle'; times = '' })
             PR-Log "NFO sent to the Recycle Bin: $f"; $n++
         } catch { PR-Log "Could not delete $f : $($_.Exception.Message)" }
+    }
+    return @{ Recycled = $n; Kept = $kept }
+}
+# ---------- duplicate subtitles (Setup: Recycle duplicate subtitles during Full Run) ----------
+$script:PR_RECYCLE_DUPSUBS = $false
+function Test-PRDupSubRow($r) { return ([string]$r.note).StartsWith('DUPLICATE sidecar target') -and ([string]$r.note).Contains('will be recycled') -and $r.PSObject.Properties['dup_of'] -and [string]$r.dup_of }
+function Get-PRDupSubLine($rows) { $n = @($rows | Where-Object { (Test-PRDupSubRow $_) -and -not (Test-PRSkipped $_) }).Count; return "Duplicate subtitles: $n (sent to the Recycle Bin on Full Run)" }
+function Remove-PRDupSubs($Rows, $Log) {
+    # sends the extra copies of a subtitle (same language already placed next to the video) to the Recycle Bin; the kept copy, videos and .nfo files are never touched
+    $n = 0; $kept = 0
+    foreach ($r in @($Rows | Where-Object { Test-PRDupSubRow $_ })) {
+        if (PR-Cancelled) { break }
+        if (Test-PRSkipped $r) { PR-Log "Duplicate subtitle kept (unticked): $($r.old_path)"; $kept++; continue }
+        $f = [string]$r.old_path; $keep = [string]$r.dup_of
+        $ext = (PR-SplitExt $f)[1].ToLowerInvariant()
+        if ((PR-Forbidden $f) -or $ext -eq '.nfo' -or -not ($script:PR_SIDECAR -contains $ext)) { PR-Log "Duplicate subtitle kept (not a subtitle or protected): $f"; $kept++; continue }
+        if (-not [IO.File]::Exists($f)) { continue }
+        if ($keep.ToLowerInvariant() -eq $f.ToLowerInvariant() -or -not [IO.File]::Exists($keep)) { PR-Log "Duplicate subtitle kept (the copy to keep is not in place: $keep): $f"; $kept++; continue }
+        if (-not (PR-HasRecycleBin $f)) { PR-Log "Duplicate subtitle kept (no Recycle Bin on this drive): $f"; $kept++; continue }
+        try {
+            $parent = PR-NativeDir $f; $pt = PR-TimesOf $parent
+            PR-RecycleFile $f
+            PR-SetTimes $parent $pt
+            $Log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $f; new_path = ''; created_dir = ''; how = 'recycle'; times = '' })
+            PR-Log "Duplicate subtitle sent to the Recycle Bin: $f (kept: $keep)"; $n++
+        } catch { PR-Log "Could not recycle $f : $($_.Exception.Message)"; $kept++ }
     }
     return @{ Recycled = $n; Kept = $kept }
 }
@@ -1170,22 +1686,24 @@ function Remove-PREmptyFolders([string[]]$Roots, $Log) {
     return $n
 }
 function Invoke-PRApply {
-    param($Rows, [switch]$HighOnly, [string]$UndoLog, [string[]]$Roots = @(), [switch]$RemoveEmpty, [switch]$DeleteNfo)
+    param($Rows, [switch]$HighOnly, [string]$UndoLog, [string[]]$Roots = @(), [switch]$RemoveEmpty, [switch]$DeleteNfo, [switch]$RecycleDupSubs, [switch]$FixSeasons)
     $cols = @('moved_at','old_path','new_path','created_dir','how','times'); $fixed = 0; $removed = 0
-    $todo = @($Rows | Where-Object { PR-ApplyTarget $_ ([bool]$HighOnly) })
-    $log = New-Object System.Collections.Generic.List[object]
+    $todo = @($Rows | Where-Object { -not (Test-PRSeasonRow $_) -and (PR-ApplyTarget $_ ([bool]$HighOnly)) })
+    $log = New-Object System.Collections.Generic.List[object]; $wrote = 0
+    $smap = @(); if ($FixSeasons) { $smap = @(Invoke-PRSeasonFolders $Rows $log); if ($smap.Count) { Add-PRCsvRows $log $UndoLog $cols ([ref]$wrote) } }   # season folders first: episode moves then use the new folder paths
     $moved = 0; $skipped = 0; $failed = 0; $n = 0; $stopped = $false
     foreach ($r in $todo) {
         $n++; PR-Progress $n $todo.Count 'Moving files'
         if (PR-Cancelled) { PR-Log 'Stopped by user.'; $stopped = $true; break }
         $old = $r.old_path; $new = PR-ApplyTarget $r ([bool]$HighOnly)
+        if ($smap.Count) { $old = PR-MapSeasonPath $old $smap; $new = PR-MapSeasonPath $new $smap }   # paths inside a renamed season folder
         try {
             if (-not [IO.File]::Exists($old)) { PR-Log "SKIP missing source: $old"; $skipped++; continue }
             # folders that differ only in letter case are renamed themselves (otherwise the same files come back on every run)
             foreach ($fx in (PR-FixDirCase (PR-NativeDir $new) $Roots)) {
                 $log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $fx.From; new_path = $fx.To; created_dir = ''; how = 'dircase'; times = '' }); $fixed++
                 if ($old.StartsWith($fx.From + '', [StringComparison]::OrdinalIgnoreCase)) { $old = $fx.To + $old.Substring($fx.From.Length) }
-                Export-PRCsv $log $UndoLog $cols
+                Add-PRCsvRows $log $UndoLog $cols ([ref]$wrote)
             }
             if ($old.ToLowerInvariant() -eq $new.ToLowerInvariant() -and (PR-Base $old) -ceq (PR-Base $new)) { continue }   # only the folder case differed: done
             $caseOnly = ($old.ToLowerInvariant() -eq $new.ToLowerInvariant())
@@ -1200,16 +1718,18 @@ function Invoke-PRApply {
             $how = 'rename'; if ($new -ne [string]$r.new_path) { $how = 'folder-only' } elseif ($HighOnly -and $r.confidence -ne 'high') { $how = 'accepted' }
             $log.Add([pscustomobject][ordered]@{ moved_at = (Get-Date -Format s); old_path = $old; new_path = $new; created_dir = $created; how = $how; times = '' })
             $moved++
-            Export-PRCsv $log $UndoLog $cols   # incremental so a crash keeps a usable log
+            Add-PRCsvRows $log $UndoLog $cols ([ref]$wrote)   # incremental so a crash keeps a usable log
         } catch { PR-Log "FAILED $old : $($_.Exception.Message)"; $failed++ }
     }
+    $dup = @{ Recycled = 0; Kept = 0 }
+    if ($RecycleDupSubs -and -not $stopped) { $dup = Remove-PRDupSubs $Rows $log; if ($dup.Recycled) { Add-PRCsvRows $log $UndoLog $cols ([ref]$wrote) } }   # after the moves (the kept copy is in place), before the empty-folder clean-up so emptied Subs folders go too
     $nfo = @{ Recycled = 0; Kept = 0 }
-    if ($DeleteNfo -and -not $stopped) { $nfo = Remove-PRNfoFiles $Roots $log; if ($nfo.Recycled) { Export-PRCsv $log $UndoLog $cols } }   # before the empty-folder clean-up, so folders that only held .nfo files go too
-    if ($RemoveEmpty -and -not $stopped) { $removed = Remove-PREmptyFolders $Roots $log; if ($removed) { Export-PRCsv $log $UndoLog $cols } }
-    $msg = "Moved $moved, skipped $skipped, failed $failed."; if ($fixed) { $msg += " Folder letter case fixed: $fixed." }; if ($DeleteNfo) { $msg += " NFO files sent to the Recycle Bin: $($nfo.Recycled)." + $(if ($nfo.Kept) { " NFO files kept (no Recycle Bin on the drive): $($nfo.Kept)." } else { '' }) }; if ($RemoveEmpty) { $msg += " Empty folders removed: $removed." }
+    if ($DeleteNfo -and -not $stopped) { $nskip = @{}; foreach ($r in $Rows) { if ((Test-PRSkipped $r) -and ([string]$r.note).StartsWith('nfo: delete')) { $nskip[([string]$r.old_path).ToLowerInvariant()] = 1 } }; $nfo = Remove-PRNfoFiles $Roots $log $nskip; if ($nfo.Recycled) { Add-PRCsvRows $log $UndoLog $cols ([ref]$wrote) } }   # before the empty-folder clean-up, so folders that only held .nfo files go too
+    if ($RemoveEmpty -and -not $stopped) { $removed = Remove-PREmptyFolders $Roots $log; if ($removed) { Add-PRCsvRows $log $UndoLog $cols ([ref]$wrote) } }
+    $msg = "Moved $moved, skipped $skipped, failed $failed."; if ($FixSeasons) { $msg += " Season folders renamed: $($smap.Count)." }; if ($fixed) { $msg += " Folder letter case fixed: $fixed." }; if ($DeleteNfo) { $msg += " NFO files sent to the Recycle Bin: $($nfo.Recycled)." + $(if ($nfo.Kept) { " NFO files kept (no Recycle Bin on the drive): $($nfo.Kept)." } else { '' }) }; if ($RecycleDupSubs) { $msg += " Duplicate subtitles sent to the Recycle Bin: $($dup.Recycled)." + $(if ($dup.Kept) { " Duplicate subtitles kept: $($dup.Kept)." } else { '' }) }; if ($RemoveEmpty) { $msg += " Empty folders removed: $removed." }
     if ($stopped) { $msg = "Stopped. " + $msg }; if ($log.Count) { $msg += " Undo log: $UndoLog" }
     PR-Log $msg
-    return @{ Moved = $moved; Skipped = $skipped; Failed = $failed; Log = $UndoLog; Cancelled = $stopped; CaseFixed = $fixed; Removed = $removed; NfoRecycled = $nfo.Recycled; NfoKept = $nfo.Kept }
+    return @{ Moved = $moved; Skipped = $skipped; Failed = $failed; Log = $UndoLog; Cancelled = $stopped; CaseFixed = $fixed; Removed = $removed; NfoRecycled = $nfo.Recycled; NfoKept = $nfo.Kept; DupRecycled = $dup.Recycled; DupKept = $dup.Kept; SeasonFixed = $smap.Count }
 }
 function Invoke-PRUndo {
     param([string]$UndoLog, [switch]$WhatIf)
@@ -1218,10 +1738,22 @@ function Invoke-PRUndo {
     foreach ($r in $rows) {
         $n++; PR-Progress $n $rows.Count 'Undoing'
         $how = ''; if ($r.PSObject.Properties['how']) { $how = [string]$r.how }
-        if ($how -eq 'recycle') { $rec++; continue }   # a .nfo sent to the Recycle Bin: restore it from there
+        if ($how -eq 'recycle') { $rec++; continue }   # a .nfo or duplicate subtitle sent to the Recycle Bin: restore it from there (Undo lists the count)
         if ($how -eq 'rmdir') {   # a removed empty folder: create it again
             if ($WhatIf) { PR-Log "recreate $($r.old_path)"; continue }
             try { if (-not [IO.Directory]::Exists($r.old_path)) { [void][IO.Directory]::CreateDirectory($r.old_path) }; $made.Add($r); $ok++ } catch { PR-Log "FAILED recreate $($r.old_path) : $($_.Exception.Message)"; $skip++ }
+            continue
+        }
+        if ($how -eq 'seasondir') {   # a renamed season folder: give it its old name back (same parent; timestamps kept)
+            if ($WhatIf) { PR-Log "$($r.new_path) -> $($r.old_path)"; continue }
+            try {
+                if (-not [IO.Directory]::Exists($r.new_path)) { PR-Log "SKIP not found: $($r.new_path)"; $skip++; continue }
+                $caseOnly = ([string]$r.old_path -ieq [string]$r.new_path)
+                if (-not $caseOnly -and [IO.Directory]::Exists($r.old_path)) { PR-Log "SKIP original folder name occupied: $($r.old_path)"; $skip++; continue }
+                $t = PR-TimesOf $r.new_path; $parent = PR-NativeDir $r.new_path; $pt = PR-TimesOf $parent
+                if ($caseOnly) { PR-MoveDirCase $r.new_path $r.old_path } else { [IO.Directory]::Move($r.new_path, $r.old_path) }
+                PR-SetTimes $r.old_path $t; PR-SetTimes $parent $pt; $ok++
+            } catch { PR-Log "FAILED $($r.new_path) : $($_.Exception.Message)"; $skip++ }
             continue
         }
         if ($how -eq 'dircase') {   # a folder whose letter case was changed: change it back
@@ -1246,7 +1778,7 @@ function Invoke-PRUndo {
     }
     for ($i = $made.Count - 1; $i -ge 0; $i--) { PR-SetTimes $made[$i].old_path ([string]$made[$i].times) }   # deepest last-created first, so a parent keeps its own time
     PR-Log "Undo: restored $ok, skipped $skip."
-    if ($rec) { PR-Log "$rec .nfo file(s) are in the Recycle Bin - restore from there if needed." }
+    if ($rec) { PR-Log "$rec recycled file(s) (.nfo / duplicate subtitles) are in the Recycle Bin - restore them from there if needed." }
     return @{ Restored = $ok; Skipped = $skip; Recycled = $rec }
 }
 
